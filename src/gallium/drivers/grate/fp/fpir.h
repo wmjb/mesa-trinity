@@ -1,0 +1,205 @@
+#ifndef FPIR_H
+#define FPIR_H
+
+#include "util/list.h"
+
+#include "stdbool.h"
+#include "stdint.h"
+
+enum fp_alu_op {
+   FP_ALU_OP_MAD = 0,
+   FP_ALU_OP_MIN = 1,
+   FP_ALU_OP_MAX = 2,
+   FP_ALU_OP_CSEL = 3
+};
+
+enum fp_scale {
+   FP_SCALE_NONE = 0,
+   FP_SCALE_MUL2 = 1,
+   FP_SCALE_MUL4 = 2,
+   FP_SCALE_DIV2 = 3
+};
+
+enum fp_condition {
+   FP_CONDITION_ALWAYS = 0,
+   FP_CONDITION_EQUAL = 1,
+   FP_CONDITION_GEQUAL = 2,
+   FP_CONDITION_GREATER = 3
+};
+
+struct fp_alu_dst_operand {
+   bool write_low_sub_reg;
+   bool write_high_sub_reg;
+   unsigned index;
+   bool saturate;
+};
+
+enum fp_datatype {
+   FP_DATATYPE_FP20 = 0,
+   FP_DATATYPE_FIXED10 = 1
+};
+
+struct fp_alu_src_operand {
+   bool scale_by_two;
+   bool negate;
+   bool absolute_value;
+   enum fp_datatype datatype;
+   bool minus_one;
+   bool sub_reg_select_high;
+   unsigned index;
+};
+
+struct fp_alu_instr {
+   enum fp_condition condition;
+
+   enum fp_alu_op op;
+   enum fp_scale scale;
+
+   struct fp_alu_dst_operand dst;
+   struct fp_alu_src_operand src[4];
+};
+
+enum fp_dw_src_regs {
+   FP_DW_REGS_R0_R1 = 0,
+   FP_DW_REGS_R2_R3 = 1
+};
+
+struct fp_dw_instr {
+   bool enable;
+   int index;
+   bool stencil_write;
+   enum fp_dw_src_regs src_regs;
+};
+
+enum fp_sfu_op {
+   FP_SFU_OP_NOP = 0,
+   FP_SFU_OP_RCP = 1,
+   FP_SFU_OP_RSQ = 2,
+   FP_SFU_OP_LG2 = 3,
+   FP_SFU_OP_EX2 = 4,
+   FP_SFU_OP_SQRT = 5,
+   FP_SFU_OP_SIN = 6,
+   FP_SFU_OP_COS = 7,
+   FP_SFU_OP_FRC = 8,
+   FP_SFU_OP_PREEX2 = 9,
+   FP_SFU_OP_PRESIN = 10,
+   FP_SFU_OP_PRECOS = 11
+};
+
+enum fp_mfu_mul_dst {
+   FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT = 1,
+   FP_MFU_MUL_DST_ROW_REG_0 = 4,
+   FP_MFU_MUL_DST_ROW_REG_1 = 5,
+   FP_MFU_MUL_DST_ROW_REG_2 = 6,
+   FP_MFU_MUL_DST_ROW_REG_3 = 7
+};
+
+enum fp_mfu_mul_src {
+   FP_MFU_MUL_SRC_ROW_REG_0 = 0,
+   FP_MFU_MUL_SRC_ROW_REG_1 = 1,
+   FP_MFU_MUL_SRC_ROW_REG_2 = 2,
+   FP_MFU_MUL_SRC_ROW_REG_3 = 3,
+   FP_MFU_MUL_SRC_SFU_RESULT = 10,
+   FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0 = 11,
+   FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1 = 12,
+   FP_MFU_MUL_SRC_CONST_1 = 13,
+};
+
+struct fp_mfu_mul {
+   enum fp_mfu_mul_dst dst;
+   enum fp_mfu_mul_src src[2];
+};
+
+enum fp_var_op {
+   FP_VAR_OP_NOP = 0,
+   FP_VAR_OP_FP20 = 1,
+   FP_VAR_OP_FX10 = 2,
+};
+
+struct fp_var_instr {
+   bool saturate;
+   enum fp_var_op op;
+   unsigned tram_row;
+};
+
+struct fp_sfu_instr {
+   enum fp_sfu_op op;
+   unsigned reg;
+};
+
+struct fp_mfu_instr {
+   struct list_head link;
+   struct fp_sfu_instr sfu;
+   struct fp_mfu_mul mul[2];
+   struct fp_var_instr var[4];
+};
+
+/*
+ * An ALU packet holds 4 scalar slots. The fourth can instead carry up to three
+ * embedded fp20 constants, which the instructions address as registers 28..30
+ * (docs/fragment-shader-isa.md, "ALU embedded constants").
+ */
+struct fp_alu_instr_packet {
+   struct list_head link;
+   struct fp_alu_instr slots[4];
+   bool has_constants;
+   uint32_t constants[3];   /* fp20-encoded */
+};
+
+uint32_t grate_fp20_from_float(float f);
+void grate_fp_pack_alu_constants(uint32_t *dst, const uint32_t *constants);
+
+/*
+ * TEX reads the coordinates from the first row of the pixel packet and writes
+ * the sampled RGBA back there as four fx10s
+ * (docs/fragment-shader-isa.md, "TEX instruction word encoding").
+ */
+struct fp_tex_instr {
+   bool enable;
+   bool bias;
+   unsigned sampler;
+   bool dst_r2_r3;   /* false: R0-R1 */
+   bool src_r2_r3;   /* false: S,T,R,LOD from R0,R1,R2,R3 */
+};
+
+struct fp_sched {
+   int num_instructions;
+   int address;
+};
+
+struct fp_instr {
+   struct list_head link;
+   // TODO: PSEQ
+   struct fp_sched mfu_sched;
+   struct fp_tex_instr tex;
+   struct fp_sched alu_sched;
+   struct fp_dw_instr dw;
+};
+
+void
+grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr);
+
+uint32_t
+grate_fp_pack_tex(struct fp_tex_instr *instr);
+
+uint32_t
+grate_fp_pack_dw(struct fp_dw_instr *instr);
+
+void
+grate_fp_pack_mfu(uint32_t *dst, struct fp_mfu_instr *instr);
+
+uint32_t
+grate_fp_pack_sched(struct fp_sched *sched);
+
+uint32_t
+grate_fp_pack_alu_sched_t114(struct fp_sched *sched);
+
+/* fragment linker words, shared by both translators */
+#define LINK_SRC(index) ((index) << 3)
+#define LINK_DST(index, comp, type) (((comp) | (type) << 2) << ((index) * 4))
+#define LINK_DST_NONE      0
+#define LINK_DST_FX10_LOW  1
+#define LINK_DST_FX10_HIGH 2
+#define LINK_DST_FP20      3
+
+#endif

@@ -1,0 +1,24 @@
+[Unit]
+Description=Phosh mobile shell session
+After=systemd-user-sessions.service seatd.service user@1000.service
+Requires=seatd.service
+Wants=user@1000.service
+
+[Service]
+Type=simple
+User=sam
+WorkingDirectory=/home/sam
+# phoc needs the seat from seatd, and gnome-session needs the user manager's
+# bus to find org.freedesktop.systemd1 - a private dbus-run-session bus does
+# not have it, which is why the session used to abort at startup.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=LIBSEAT_BACKEND=seatd
+Environment=XDG_SESSION_TYPE=wayland
+SupplementaryGroups=video render input seat
+ExecStart=/usr/bin/phosh-session
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target

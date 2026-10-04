@@ -375,8 +375,14 @@ DRM_DRIVER_DESCRIPTOR(etnaviv, NULL, 0)
 DRM_DRIVER_DESCRIPTOR_STUB(etnaviv)
 #endif
 
-#ifdef GALLIUM_TEGRA
+#if defined(GALLIUM_TEGRA) || defined(GALLIUM_GRATE)
+#ifdef GALLIUM_GRATE
+/* grate drives Tegra20/30/114 GR3D directly */
+#include "grate/grate_screen.h"
+#define tegra_drm_screen_create grate_screen_create
+#else
 #include "tegra/drm/tegra_drm_public.h"
+#endif
 
 static struct pipe_screen *
 pipe_tegra_create_screen(int fd, const struct pipe_screen_config *config)

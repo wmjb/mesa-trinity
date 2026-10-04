@@ -7,3 +7,5 @@
 /build
 .venv/
 *.mda.tar
+*.log
+stage-main/

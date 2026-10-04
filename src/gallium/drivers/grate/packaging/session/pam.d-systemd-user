@@ -1,0 +1,8 @@
+# Needed by systemd's user@.service. Without this file PAM falls back to a
+# default that references pam_selinux.so, which is not installed here, so the
+# user manager dies at step PAM - and with it the user dbus that gnome-session
+# needs to find org.freedesktop.systemd1.
+account  required pam_unix.so
+session  required pam_loginuid.so
+session  optional pam_keyinit.so force revoke
+session  optional pam_systemd.so

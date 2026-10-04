@@ -1,0 +1,22 @@
+#!/bin/sh
+# weston-grate-shot [out.png] - grab weston's screen to a PNG.
+# Needs weston started with --debug, which is what enables the screenshooter.
+set -eu
+out="${1:-/tmp/weston-shot.png}"
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+[ -n "${WAYLAND_DISPLAY:-}" ] || WAYLAND_DISPLAY=$(cd "$XDG_RUNTIME_DIR" && ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+export WAYLAND_DISPLAY
+[ -n "$WAYLAND_DISPLAY" ] || { echo "weston-grate-shot: no wayland socket" >&2; exit 1; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+if ! weston-screenshooter 2>&1 | grep -q .; then :; fi
+shot=$(ls -t wayland-screenshot-*.png 2>/dev/null | head -1)
+if [ -z "$shot" ] || [ ! -s "$shot" ]; then
+    echo "weston-grate-shot: capture failed - was weston started with --debug?" >&2
+    exit 1
+fi
+mv "$shot" "$out"
+echo "$out"

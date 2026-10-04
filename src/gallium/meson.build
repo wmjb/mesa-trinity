@@ -139,6 +139,8 @@ endif
 if with_gallium_tegra
   subdir('winsys/tegra/drm')
   subdir('drivers/tegra')
+elif with_gallium_grate
+  subdir('drivers/grate')
 else
   driver_tegra = declare_dependency()
 endif

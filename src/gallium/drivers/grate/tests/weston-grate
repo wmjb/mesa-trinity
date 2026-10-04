@@ -1,0 +1,51 @@
+#!/bin/sh
+# weston-grate - run weston on the panel using the grate Tegra 3 GL driver.
+#
+# Run this on the device, from a tty (Ctrl-Alt-F1). Weston's drm backend needs
+# a seat, and this libseat only has the logind and seatd backends, so an ssh
+# session will not do - logind gives it no seat.
+#
+#   weston-grate                              # panel, GL renderer
+#   weston-grate --renderer=pixman            # software, to compare against
+#   GRATE_MESA=$HOME/Dev/stage-main weston-grate   # try a build uninstalled
+#   weston-grate --debug          # then weston-grate-shot to capture the screen
+#
+# Extra arguments are passed through to weston.
+
+set -eu
+
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+[ -d "$XDG_RUNTIME_DIR" ] || { mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"; }
+
+if [ ! -e /dev/dri/card1 ]; then
+    echo "weston-grate: /dev/dri/card1 is missing - is tegra-drm loaded?" >&2
+    exit 1
+fi
+
+# Without a seat weston dies inside libseat with a message that does not
+# explain itself, so check here and say what to do instead.
+seat=$(loginctl show-session "${XDG_SESSION_ID:-none}" -p Seat 2>/dev/null | cut -d= -f2)
+if [ -z "$seat" ]; then
+    echo "weston-grate: this session has no seat, so the drm backend cannot start." >&2
+    echo "  Run it on the device from a tty (Ctrl-Alt-F1), not over ssh." >&2
+    echo "  Or, to allow it from anywhere:  sudo apk add seatd && sudo rc-service seatd start" >&2
+    exit 1
+fi
+
+# Optionally run against an uninstalled Mesa build, so a rebuild can be tried
+# without overwriting the system one.
+if [ -n "${GRATE_MESA:-}" ]; then
+    [ -f "$GRATE_MESA/lib/libgallium-26.3.0-devel.so" ] || {
+        echo "weston-grate: no mesa build under $GRATE_MESA" >&2; exit 1; }
+    LD_LIBRARY_PATH="$GRATE_MESA/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    GBM_BACKENDS_PATH="$GRATE_MESA/lib/gbm"
+    export LD_LIBRARY_PATH GBM_BACKENDS_PATH
+    echo "weston-grate: using mesa from $GRATE_MESA"
+fi
+
+[ "${LIBGL_ALWAYS_SOFTWARE:-0}" = "0" ] || \
+    echo "weston-grate: LIBGL_ALWAYS_SOFTWARE is set - unset it to use the GPU" >&2
+
+echo "weston-grate: starting on seat $seat, output LVDS-1"
+exec weston --backend=drm --renderer=gl "$@"
