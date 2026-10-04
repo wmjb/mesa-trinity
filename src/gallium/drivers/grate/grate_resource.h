@@ -24,6 +24,15 @@ grate_resource(struct pipe_resource *resource)
    return (struct grate_resource *)resource;
 }
 
+
+bool
+grate_resource_get_handle(struct pipe_screen *pscreen,
+                          struct pipe_context *context,
+                          struct pipe_resource *presource,
+                          struct winsys_handle *handle,
+                          unsigned usage);
+
+
 int
 grate_pixel_format(enum pipe_format format);
 

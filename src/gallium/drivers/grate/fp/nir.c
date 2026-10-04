@@ -1,11 +1,6 @@
-/*
- * NIR to Tegra fragment program.
- *
- * The fragment ALU is scalar with four slots to a packet, so NIR is scalarised
- * and every SSA definition gets one scalar register. That is a better fit than
- * the vec4 granularity the TGSI path had to use, because the register file is
- * only 19 scalars deep.
- */
+/* * NIR to Tegra fragment program. * * The fragment ALU is scalar with four slots to a packet, so NIR is scalarised * and every SSA 
+ definition gets one scalar register. That is a better fit than * the vec4 granularity the TGSI path had to use, because the register file is 
+ * only 19 scalars deep. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -131,18 +126,20 @@ fp_src_one(void)
    return s;
 }
 
-/* TEX writes RGBA into R2-R3 as four fx10s */
 static struct fp_alu_src_operand
 fp_src_tex(unsigned comp)
 {
-   int o = comp < 3 ? (2 - comp) : 3;
-   struct fp_alu_src_operand s = {
-      .index = 2 + o / 2,
-      .datatype = FP_DATATYPE_FIXED10,
-      .sub_reg_select_high = (o % 2) != 0,
-   };
+   struct fp_alu_src_operand s = { 0 };
+   s.datatype = FP_DATATYPE_FIXED10;
+   switch (comp) {
+   case 0: s.index = 2; s.sub_reg_select_high = false; break; 
+   case 1: s.index = 2; s.sub_reg_select_high = true;  break; 
+   case 2: s.index = 3; s.sub_reg_select_high = false; break; 
+   case 3: s.index = 3; s.sub_reg_select_high = true;  break; 
+   }
    return s;
 }
+
 
 /* up to three fp20 constants ride in a packet's fourth slot as registers 28..30 */
 static int
@@ -193,13 +190,15 @@ fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input: {
-         /*
-          * Varyings are interpolated once, up front, into temporaries. Asking
-          * the MFU for the same varying twice does not give the same answer
-          * the second time, so a shader that reads one component in two
-          * instructions used to get two different values for it.
-          */
          unsigned row = nir_intrinsic_base(intr);
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+
+if ((sem.location == VARYING_SLOT_VAR0 ||
+              (sem.location >= VARYING_SLOT_TEX0 &&
+               sem.location <= VARYING_SLOT_TEX7)) &&
+             ctx->fp->info.texcoord_row >= 0) {
+             row = ctx->fp->info.texcoord_row;
+         }
 
          /* interpolated by the instruction being built: the copy of it does
           * not exist until this instruction ends, so read the row register */
@@ -273,7 +272,10 @@ fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
       /* fetched by the previous instruction: R2-R3 still hold it, and this is
        * the only instruction in which that is true */
       if (ctx->tex_def == src.ssa)
-         return fp_src_tex(comp);
+          if (comp == 0) {  /* clear once on first component */
+              ctx->tex_def = NULL;
+          }   
+      return fp_src_tex(comp);
 
       if (*slot >= 0) {
          op.index = fp_reg_for_slot(ctx, *slot);
@@ -714,6 +716,9 @@ fp_emit_csel(struct fp_nir_ctx *ctx, nir_alu_instr *alu, enum fp_condition cond)
       ctx->dying[ctx->num_dying++] = diff;
 }
 
+
+
+
 static void
 fp_emit_alu(struct fp_nir_ctx *ctx, nir_alu_instr *alu)
 {
@@ -743,9 +748,38 @@ fp_emit_alu(struct fp_nir_ctx *ctx, nir_alu_instr *alu)
    case nir_op_fcsel_ge: fp_emit_csel(ctx, alu, FP_CONDITION_GEQUAL); break;
    case nir_op_fsat: fp_emit_form(ctx, alu, FP_ALU_OP_MAD, FP_FORM_MOV,
                                   FP_CONDITION_ALWAYS); break;
+
+case nir_op_frsq:
+      fp_emit_form(ctx, alu, FP_SFU_OP_RSQ, FP_FORM_MOV,
+                             FP_CONDITION_ALWAYS);
+      break;
+
+
+case nir_op_flog2:
+      fp_emit_form(ctx, alu, FP_SFU_OP_LG2, FP_FORM_MOV,
+                             FP_CONDITION_ALWAYS);
+      break;
+   case nir_op_fexp2:
+      fp_emit_form(ctx, alu, FP_SFU_OP_EX2, FP_FORM_MOV,
+                             FP_CONDITION_ALWAYS);
+      break;
+
+case nir_op_frcp:
+      fp_emit_form(ctx, alu, FP_SFU_OP_RCP, FP_FORM_MOV,
+                             FP_CONDITION_ALWAYS);
+      break;
+
+
+
    /* negation and absolute value are operand modifiers, not instructions */
+   case nir_op_fsqrt:
+//NIR_PASS_V(shader, nir_lower_fsqrt);
+
+
+   case nir_op_ffract:
    case nir_op_fneg:
    case nir_op_fabs:
+   case nir_op_fpow:
       /* folded into whatever reads them */
       break;
 
@@ -848,108 +882,90 @@ fp_emit_store_output(struct fp_nir_ctx *ctx, nir_intrinsic_instr *intr)
 static void
 fp_emit_tex(struct fp_nir_ctx *ctx, nir_tex_instr *tex)
 {
-   fp_flush(ctx);
-
-   struct grate_fp_shader *fp = ctx->fp;
-   struct fp_instr *inst = fp_new_instr();
-   int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-
-   if (coord_idx < 0) {
-      fprintf(stderr, "GRATE FRAG NIR: texture with no coordinate\n");
-      fp->unsupported = true;
-      FREE(inst);
-      return;
-   }
-
-   nir_src coord = tex->src[coord_idx].src;
-   nir_instr *cp = nir_def_instr(coord.ssa);
-   bool coord_is_varying = false;
-   unsigned row = 0;
-
-   if (cp->type == nir_instr_type_intrinsic) {
-      nir_intrinsic_op op = nir_instr_as_intrinsic(cp)->intrinsic;
-      if (op == nir_intrinsic_load_input ||
-          op == nir_intrinsic_load_interpolated_input) {
-         coord_is_varying = true;
-         row = nir_intrinsic_base(nir_instr_as_intrinsic(cp));
-      }
-   }
-
-   /*
-    * TEX always reads S and T from row registers 0 and 1. A varying lands
-    * there through the MFU; anything else has to be moved there by an ALU
-    * packet in a preceding instruction.
-    */
-   if (coord_is_varying) {
-      struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
-      list_inithead(&mfu->link);
-
-      for (unsigned c = 0; c < 2; ++c) {
-         mfu->var[c].op = FP_VAR_OP_FP20;
-         mfu->var[c].tram_row = row;
-      }
-      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, row);
-
-      inst->mfu_sched.address = list_length(&fp->mfu_instructions);
-      inst->mfu_sched.num_instructions = 1;
-      list_addtail(&mfu->link, &fp->mfu_instructions);
-   } else {
-      struct fp_instr *setup = fp_new_instr();
-      struct fp_alu_instr_packet *pkt = fp_new_packet(fp);
-
-      for (unsigned c = 0; c < 2; ++c) {
-         struct fp_alu_src_operand src = fp_nir_src(ctx, coord, c);
-         struct fp_alu_dst_operand d = {
-            .index = c,                  /* row register 0 / 1 */
-            .write_low_sub_reg = true,
-            .write_high_sub_reg = true,
-         };
-         pkt->slots[c] = (struct fp_alu_instr){
-            .op = FP_ALU_OP_MAD,
-            .dst = d,
-            .src = { src, fp_src_one(), fp_src_zero(), fp_src_zero() },
-         };
-      }
-
-      if (ctx->num_constants > 0) {
-         pkt->has_constants = true;
-         memcpy(pkt->constants, ctx->constants, sizeof(pkt->constants));
-         ctx->num_constants = 0;
-      }
-
-      setup->alu_sched.address = list_length(&fp->alu_instructions);
-      setup->alu_sched.num_instructions = 1;
-      list_addtail(&pkt->link, &fp->alu_instructions);
-      list_addtail(&setup->link, &fp->fp_instructions);
-   }
-
+   struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
    inst->tex.enable = true;
    inst->tex.sampler = tex->sampler_index;
    inst->tex.dst_r2_r3 = true;
    inst->tex.src_r2_r3 = false;
 
-   list_addtail(&inst->link, &fp->fp_instructions);
+   unsigned coord_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_src *coord_src = &tex->src[coord_src_idx].src;
 
-   /*
-    * R2-R3 hold this result for the next instruction only, so copy out every
-    * component the shader reads while it still can. Waiting for the first
-    * read is too late: the instruction being built is flushed whenever an
-    * operation depends on one already in it, and the texel is gone by then.
-    */
-   ctx->tex_def = &tex->def;
+   /* ===== TRACE BACK TO THE ACTUAL VARYING SOURCE ===== */
+   nir_def *def = coord_src->ssa;
+   nir_instr *coord_instr = nir_def_instr(def);
 
-   unsigned read = nir_def_components_read(&tex->def);
+   unsigned row = ctx->fp->info.texcoord_row;
+   bool found_source = false;
 
-   for (unsigned c = 0; c < 4; ++c) {
-      if (!(read & (1u << c)) || ctx->num_keep >= ARRAY_SIZE(ctx->keep))
-         continue;
+   /* Walk through vec2/vec3/vec4 constructors to find the load_input underneath */
+   while (!found_source && coord_instr) {
+      if (coord_instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(coord_instr);
+         if (intr->intrinsic == nir_intrinsic_load_input ||
+             intr->intrinsic == nir_intrinsic_load_interpolated_input) {
 
-      ctx->keep[ctx->num_keep].src = fp_src_tex(c);
-      ctx->keep[ctx->num_keep].slot = fp_alloc_slot(ctx);
-      ctx->keep[ctx->num_keep].commit = &ctx->tex_slot[tex->def.index * 4 + c];
-      ctx->num_keep++;
+nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+              if (sem.location == VARYING_SLOT_VAR0 ||
+                  (sem.location >= VARYING_SLOT_TEX0 &&  // watch typo: VARYING_SLOT_TEX0
+                   sem.location <= VARYING_SLOT_TEX7)) {
+                  row = ctx->fp->info.texcoord_row;
+                  found_source = true;
+                  fprintf(stderr, ">>> GRATE-FP: Found texcoord source row=%u\n", row);
+                  fflush(stderr);
+              }
+
+             break;
+         }
+      }
+      /* Follow vecN sources back to their origin */
+      if (coord_instr->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(coord_instr);
+         if (alu->op == nir_op_vec2 || alu->op == nir_op_vec3 || alu->op == nir_op_vec4) {
+             /* Follow first source (X component) back — both come from same varying */
+             def = alu->src[0].src.ssa;
+             coord_instr = nir_def_instr(def);
+             continue;
+         }
+      }
+      break; /* Reached something else — stop */
    }
+
+   if (!found_source) {
+      fprintf(stderr, ">>> GRATE-FP: Using texcoord_row=%u (direct or fallback)\n", row);
+      fflush(stderr);
+   }
+   /* =================================================== */
+
+
+/* BOTH S and T from consecutive rows of the vector attribute */
+   if (ctx->fp->info.texcoord_row >= 0) {
+      struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
+      list_inithead(&mfu->link);
+
+      /* S = component 0 (row) */
+      mfu->var[0].op = FP_VAR_OP_FP20;
+      mfu->var[0].tram_row = row;
+
+      /* T = component 1 (row) */
+      mfu->var[1].op = FP_VAR_OP_FP20;
+      mfu->var[1].tram_row = row;
+
+      /* R = component 2 (row) if needed, or leave NOP/same */
+      mfu->var[2].op = FP_VAR_OP_FP20;
+      mfu->var[2].tram_row = row;
+
+      ctx->fp->info.max_tram_row = MAX2(ctx->fp->info.max_tram_row, row);
+      inst->mfu_sched.address = list_length(&ctx->fp->mfu_instructions);
+      inst->mfu_sched.num_instructions = 1;
+      list_addtail(&mfu->link, &ctx->fp->mfu_instructions);
+   }
+
+
+   list_addtail(&inst->link, &ctx->fp->fp_instructions);
+   ctx->tex_def = &tex->def;
 }
+
 
 static void
 fp_emit_intrinsic(struct fp_nir_ctx *ctx, nir_intrinsic_instr *intr)
@@ -1123,13 +1139,16 @@ fp_release_use(nir_src *src, void *data)
    return true;
 }
 
+
+
 void
 grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
 {
+   fprintf(stderr, ">>> GRATE-FP: Starting shader translate\n");
+   fflush(stderr);
    list_inithead(&fp->fp_instructions);
    list_inithead(&fp->alu_instructions);
    list_inithead(&fp->mfu_instructions);
-
    fp->num_immediates = 0;
    fp->num_temps = 0;
    fp->unsupported = false;
@@ -1137,34 +1156,55 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
    fp->info.num_inputs = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+   fp->info.texcoord_row = -1;
 
-   /*
-    * One linker entry per varying the shader reads. Only the components the
-    * varying actually has are routed: grate's reference linker leaves the
-    * rest NOP, and enabling all four shifts what the TRAM delivers.
-    */
-   nir_foreach_shader_in_variable(var, s) {
-      unsigned row = var->data.driver_location;
-      unsigned n = glsl_get_vector_elements(glsl_without_array(var->type));
-      uint32_t dst = 0;
+nir_foreach_shader_in_variable(var, s) {
+      unsigned row = var->data.driver_location; //plus one
+      bool is_texcoord = false;
 
-      for (unsigned i = 0; i < n && i < 4; ++i)
-         dst |= LINK_DST(i, i, LINK_DST_FP20);
+      if (var->data.location == VARYING_SLOT_VAR0 ||
+          (var->data.location >= VARYING_SLOT_TEX0 &&
+           var->data.location <= VARYING_SLOT_TEX7)) {
 
-      fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(1);
-      fp->info.inputs[fp->info.num_inputs].dst = dst;
-      fp->info.num_inputs++;
+         if (var->data.location != VARYING_SLOT_VAR0 ||
+             !var->name || strcmp(var->name, "Color") != 0) {
+             is_texcoord = true;
+         }
 
-      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, row);
+         var->data.interpolation = INTERP_MODE_SMOOTH;
+      }
 
       if (var->data.location == VARYING_SLOT_COL0)
          fp->info.color_input = row;
+
+      if (is_texcoord) {
+         fp->info.texcoord_row = row;
+         fprintf(stderr, ">>> GRATE-FP: texcoord_row = %u\n", row);
+      }
+
+      fprintf(stderr, ">>> GRATE-FP: input loc=%d row=%u name=%s\n",
+              var->data.location, row, var->name ? var->name : "(null)");
+      fflush(stderr);
+
+      unsigned n = glsl_get_vector_elements(glsl_without_array(var->type));
+      uint32_t dst = 0;
+      for (unsigned i = 0; i < n && i < 4; ++i)
+         dst |= LINK_DST(i, i, LINK_DST_FP20);
+
+      if (fp->info.num_inputs < ARRAY_SIZE(fp->info.inputs)) {
+         fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(row +1);
+         fp->info.inputs[fp->info.num_inputs].dst = dst;
+         fp->info.num_inputs++;
+      }
+
+      if (row > fp->info.max_tram_row)
+         fp->info.max_tram_row = row;
    }
 
    nir_function_impl *impl = nir_shader_get_entrypoint(s);
-
    struct fp_nir_ctx ctx = { 0 };
    ctx.fp = fp;
+   ctx.tex_def = NULL;
    for (unsigned r = 0; r < 16; ++r)
       for (unsigned c = 0; c < 4; ++c) {
          ctx.varying_slot[r][c] = -1;
@@ -1178,11 +1218,6 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
    for (unsigned i = 0; i < impl->ssa_alloc * 4; ++i)
       ctx.tex_slot[i] = -1;
 
-   /*
-    * Nineteen scalar registers is not many, so a slot has to go back on the
-    * free list once the value in it has been read for the last time. Work out
-    * where that is before translating anything.
-    */
    ctx.last_use = CALLOC(impl->ssa_alloc, sizeof(unsigned));
    {
       unsigned idx = 0;
@@ -1190,27 +1225,18 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
          nir_foreach_instr(instr, block) {
             nir_foreach_src(instr, fp_note_use, &(struct fp_use_ctx){
                .ctx = &ctx, .idx = idx });
-            idx++;
+           idx++;
          }
       }
-
-      /*
-       * vecN only gathers and the modifiers are folded into whatever reads
-       * them, so none of these emit anything: their sources have to stay live
-       * until the operation that consumes the result, not until the
-       * instruction that nominally reads them.
-       */
       nir_foreach_block_reverse(block, impl) {
          nir_foreach_instr_reverse(instr, block) {
             if (instr->type != nir_instr_type_alu)
                continue;
-
             nir_alu_instr *a = nir_instr_as_alu(instr);
             if (a->op != nir_op_vec2 && a->op != nir_op_vec3 &&
                 a->op != nir_op_vec4 && a->op != nir_op_fneg &&
                 a->op != nir_op_fabs)
                continue;
-
             nir_foreach_src(instr, fp_extend_use, &(struct fp_use_ctx){
                .ctx = &ctx, .idx = ctx.last_use[a->def.index] });
          }
@@ -1240,7 +1266,6 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
             fp->unsupported = true;
             break;
          }
-
          nir_foreach_src(instr, fp_release_use, &(struct fp_use_ctx){
             .ctx = &ctx, .idx = idx });
          idx++;
@@ -1248,24 +1273,21 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
    }
 
    fp_flush(&ctx);
-
    FREE(ctx.ssa_slot);
    FREE(ctx.tex_slot);
    FREE(ctx.last_use);
 
-   /* store what the ALU built up in R2-R3, once, at the end */
    if (!list_is_empty(&fp->fp_instructions)) {
       struct fp_instr *last =
          list_last_entry(&fp->fp_instructions, struct fp_instr, link);
-
       last->dw.enable = 1;
       last->dw.index = 0;
       last->dw.stencil_write = 0;
       last->dw.src_regs = FP_DW_REGS_R2_R3;
    }
-
    if (ctx.overflow)
       fp->unsupported = true;
-
    grate_fp_finish(fp);
 }
+
+

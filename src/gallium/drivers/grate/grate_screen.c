@@ -485,8 +485,10 @@ static const nir_shader_compiler_options grate_base_compiler_options = {
    .lower_flrp32 = true,
    .lower_flrp64 = true,
    .lower_fmod = true,
+*/
    .lower_fpow = true, // In hardware as of nv40
-   .lower_uniforms_to_ubo = true,
+/* 
+  .lower_uniforms_to_ubo = true,
    .lower_vector_cmp = true,
    .force_indirect_unrolling = nir_var_all,
    .force_indirect_unrolling_sampler = true,
@@ -546,6 +548,8 @@ grate_screen_create(int fd)
    screen->base.is_format_supported = grate_screen_is_format_supported;
    screen->base.query_dmabuf_modifiers = grate_screen_query_dmabuf_modifiers;
    screen->base.is_dmabuf_modifier_supported = grate_screen_is_dmabuf_modifier_supported;
+
+   screen->base.resource_get_handle = grate_resource_get_handle;
    
    screen->base.nir_options[MESA_SHADER_VERTEX] = &grate_base_compiler_options;
    screen->base.nir_options[MESA_SHADER_FRAGMENT] = &grate_base_compiler_options;

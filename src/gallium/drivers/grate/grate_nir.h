@@ -11,4 +11,6 @@ void grate_nir_lower_vs(struct nir_shader *s);
  * maths, no control flow, varyings resolved to load_input. */
 void grate_nir_lower_fs(struct nir_shader *s);
 
+void grate_nir_invert_texcoord_v(nir_shader *s);
+
 #endif

@@ -7,6 +7,7 @@
  * that is beyond this hardware anyway, so there is no reuse and no register
  * allocator - running out is reported rather than papered over.
  */
+
 #include <stdio.h>
 
 #include "compiler/nir/nir.h"
@@ -20,16 +21,24 @@
 /* the packer disables a write by naming register 63 */
 #define VP_NUM_TEMPS 62
 
+enum vp_unit {
+   VP_UNIT_NONE = 0,
+   VP_UNIT_VEC,
+   VP_UNIT_SCALAR,
+};
+
 struct vp_nir_ctx {
    struct grate_vp_shader *vp;
    int *ssa_temp;          /* SSA index -> temporary, or -1 */
    unsigned num_temps;
    bool overflow;
+   enum vp_unit reg_last_writer[256];
 };
 
 static const enum vp_swz identity_swz[4] = {
    VP_SWZ_X, VP_SWZ_Y, VP_SWZ_Z, VP_SWZ_W
 };
+
 
 static int
 vp_alloc_temp(struct vp_nir_ctx *ctx)
@@ -170,6 +179,49 @@ vp_vnop(void)
    return v;
 }
 
+static void
+vp_nir_push(struct vp_nir_ctx *ctx, struct vp_vec_instr v, struct vp_scalar_instr s)
+{
+   bool has_vec = (v.op != VP_VEC_OP_NOP);
+   bool has_scl = (s.op != VP_SCALAR_OP_NOP);
+   bool hazard = false;
+
+   /* 1. Check Scalar-to-Vector hazard */
+   if (has_vec) {
+      for (int i = 0; i < 3; i++) {
+         if (v.src[i].file == VP_SRC_FILE_TEMP && 
+             ctx->reg_last_writer[v.src[i].index] == VP_UNIT_SCALAR) {
+            hazard = true;
+            break;
+         }
+      }
+   }
+
+   /* 2. Check Vector-to-Scalar hazard */
+   if (has_scl) {
+      if (s.src.file == VP_SRC_FILE_TEMP && 
+          ctx->reg_last_writer[s.src.index] == VP_UNIT_VEC) {
+         hazard = true;
+      }
+   }
+
+   /* Insert NOP stall packet if a RAW hazard is detected */
+   if (hazard) {
+      vp_push(ctx->vp, vp_vnop(), vp_snop());
+      memset(ctx->reg_last_writer, 0, sizeof(ctx->reg_last_writer));
+   }
+
+   vp_push(ctx->vp, v, s);
+
+   /* Update last writer specifically for the written destination register */
+   if (has_vec && v.dst.file == VP_DST_FILE_TEMP) {
+      ctx->reg_last_writer[v.dst.index] = VP_UNIT_VEC;
+   }
+   if (has_scl && s.dst.file == VP_DST_FILE_TEMP) {
+      ctx->reg_last_writer[s.dst.index] = VP_UNIT_SCALAR;
+   }
+}
+
 /*
  * Only one attribute and one uniform may be fetched per instruction, so any
  * further ones are copied into temporaries first. Left unchecked the packer
@@ -208,8 +260,7 @@ vp_stage_fetches(struct vp_nir_ctx *ctx, struct vp_src_operand *src, unsigned n)
       mov.dst.index = tmp;
       mov.dst.write_mask = 0xf;
       mov.src[0] = copy;
-      vp_push(ctx->vp, mov, vp_snop());
-
+      vp_nir_push(ctx, mov, vp_snop());
       src[i].file = VP_SRC_FILE_TEMP;
       src[i].index = tmp;
    }
@@ -250,35 +301,74 @@ vp_scalar_op_for(nir_op op, enum vp_scalar_op *out)
    default: return false;
    }
 }
-
 /*
- * vecN gathers scalars into one vector. Each component may come from a
- * different place, so it becomes one move per component into the same
- * temporary, each with its own write mask.
- */
 static void
 vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
 {
    int dst = vp_temp_for_def(ctx, &alu->def);
 
    for (unsigned i = 0; i < n; ++i) {
-      struct vp_src_operand src[1];
-      src[0] = vp_src(ctx, alu->src[i].src, alu->src[i].swizzle);
+      struct vp_src_operand src = vp_src(ctx, alu->src[i].src, alu->src[i].swizzle);
 
-      /* every component of the move reads the one scalar being placed */
+      unsigned swz_elem = alu->src[i].swizzle[0];
       for (int c = 0; c < 4; ++c)
-         src[0].swizzle[c] = (enum vp_swz)alu->src[i].swizzle[0];
+         src.swizzle[c] = (enum vp_swz)swz_elem;
 
-      vp_stage_fetches(ctx, src, 1);
+      vp_stage_fetches(ctx, &src, 1);
 
       struct vp_vec_instr v = vp_vnop();
       v.op = VP_VEC_OP_MOV;
       v.dst.file = VP_DST_FILE_TEMP;
       v.dst.index = dst;
       v.dst.write_mask = 1u << i;
-      v.src[0] = src[0];
+      v.src[0] = src;
       vp_push(ctx->vp, v, vp_snop());
    }
+}
+*/
+
+
+static void
+vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
+{
+   int dst = vp_temp_for_def(ctx, &alu->def);
+
+   for (unsigned i = 0; i < n; ++i) {
+      unsigned src_idx = i;
+      if (n == 3) {
+         /*
+          * Correct Map:
+          * index 0 (.x) <- texcoord.x (source 1) -> S
+          * index 1 (.y) <- texcoord.y (source 2) -> T
+          * index 2 (.z) <- lighting   (source 0) -> Lighting
+          */
+         static const uint8_t map[3] = { 1, 2, 0 };
+         src_idx = map[i];
+      }
+
+      struct vp_src_operand src = vp_src(ctx, alu->src[src_idx].src, alu->src[src_idx].swizzle);
+
+      /* Explicitly enforce the component swizzle from NIR */
+      unsigned swz_elem = alu->src[src_idx].swizzle[0];
+      for (int c = 0; c < 4; ++c)
+         src.swizzle[c] = (enum vp_swz)swz_elem;
+
+      vp_stage_fetches(ctx, &src, 1);
+
+      struct vp_vec_instr v = vp_vnop();
+      v.op = VP_VEC_OP_MOV;
+      v.dst.file = VP_DST_FILE_TEMP;
+      v.dst.index = dst;
+      v.dst.write_mask = 1u << i;
+      v.src[0] = src;
+      
+      // If you want to handle 1.0 - T inversion right here for component .y:
+      // (Assuming grate's vector instruction format supports constant/negation modifiers, 
+      // or you can leave V-inversion to the NIR pass we built earlier and just fix the map here)
+
+//      vp_push(ctx->vp, v, vp_snop());
+      vp_nir_push(ctx, v, vp_snop()); 
+  }
 }
 
 static void
@@ -314,9 +404,13 @@ vp_emit_alu(struct vp_nir_ctx *ctx, nir_alu_instr *alu)
       s.dst.index = vp_temp_for_def(ctx, &alu->def);
       s.dst.write_mask = (1u << alu->def.num_components) - 1;
       s.src = src[0];
-      vp_push(ctx->vp, vp_vnop(), s);
+  //    vp_push(ctx->vp, vp_vnop(), s);
+
+vp_nir_push(ctx, vp_vnop(), s);
       return;
    }
+
+
 
    if (!vp_vec_op_for(alu->op, &vop)) {
       fprintf(stderr, "GRATE VERTEX NIR UNIMPLEMENTED: %s\n",
@@ -344,35 +438,54 @@ vp_emit_alu(struct vp_nir_ctx *ctx, nir_alu_instr *alu)
    vp_push(ctx->vp, v, vp_snop());
 }
 
+
 static void
 vp_emit_intrinsic(struct vp_nir_ctx *ctx, nir_intrinsic_instr *intr)
 {
    switch (intr->intrinsic) {
    case nir_intrinsic_load_input:
    case nir_intrinsic_load_uniform:
-      /* resolved where they are used */
       return;
 
-   case nir_intrinsic_store_output: {
+case nir_intrinsic_store_output: {
       unsigned base = nir_intrinsic_base(intr);
+      nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+      unsigned write_mask = nir_intrinsic_write_mask(intr);
+
+      fprintf(stderr, ">>> GRATE-VP: store_output loc=%d base=%d mask=%x\n",
+              sem.location, base, write_mask);
+      fflush(stderr);
 
       struct vp_src_operand s = vp_src(ctx, intr->src[0], NULL);
-      struct vp_src_operand one[3] = { s };
 
+      /*
+       * For VARYING_SLOT_VAR0, the vector contains [lighting, S, T] at components [0, 1, 2].
+       * The hardware MFU expects [S, T, lighting] at components [0, 1, 2].
+       * We swizzle the source components directly:
+       * - Component 0 gets source component 1 (S)
+       * - Component 1 gets source component 2 (T)
+       * - Component 2 gets source component 0 (lighting)
+       */
+/*      if (sem.location == VARYING_SLOT_VAR0) {
+         s.swizzle[0] = VP_SWZ_Y; // S -> comp 0
+         s.swizzle[1] = VP_SWZ_Z; // T -> comp 1
+         s.swizzle[2] = VP_SWZ_X; // lighting -> comp 2
+      }
+*/
+      struct vp_src_operand one[3] = { s };
       vp_stage_fetches(ctx, one, 1);
 
       struct vp_vec_instr v = vp_vnop();
       v.op = VP_VEC_OP_MOV;
       v.dst.file = VP_DST_FILE_OUTPUT;
       v.dst.index = base;
-      v.dst.write_mask = nir_intrinsic_write_mask(intr);
+      v.dst.write_mask = write_mask;
       v.src[0] = one[0];
-      vp_push(ctx->vp, v, vp_snop());
-
+//      vp_push(ctx->vp, v, vp_snop());
+      vp_nir_push(ctx, v, vp_snop());
       ctx->vp->output_mask |= 1u << base;
       return;
    }
-
    default:
       fprintf(stderr, "GRATE VERTEX NIR UNIMPLEMENTED intrinsic: %s\n",
               nir_intrinsic_infos[intr->intrinsic].name);
@@ -383,6 +496,8 @@ vp_emit_intrinsic(struct vp_nir_ctx *ctx, nir_intrinsic_instr *intr)
 void
 grate_nir_to_vp(struct grate_vp_shader *vp, nir_shader *s)
 {
+   fprintf(stderr, ">>> GRATE-VP: Starting shader translate\n");
+   fflush(stderr);
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
    vp->num_immediates = 0;

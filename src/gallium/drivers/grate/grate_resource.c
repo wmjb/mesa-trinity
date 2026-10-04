@@ -28,7 +28,9 @@
 #include "frontend/drm_driver.h"
 
 
-static bool
+
+
+bool
 grate_resource_get_handle(struct pipe_screen *pscreen,
                           struct pipe_context *context,
                           struct pipe_resource *presource,
@@ -38,10 +40,19 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
    struct grate_resource *resource;
    int ret;
 
-   if (presource->target == PIPE_BUFFER)
+   if (presource->target == PIPE_BUFFER) {
+      fprintf(stderr, "grate_resource_get_handle: rejected PIPE_BUFFER\n");
       return false;
+   }
 
    resource = grate_resource(presource);
+   if (!resource || !resource->bo) {
+      fprintf(stderr, "grate_resource_get_handle: resource or resource->bo is NULL!\n");
+      return false;
+   }
+
+   fprintf(stderr, "grate_resource_get_handle: requested handle type = %d (FD is usually %d)\n", 
+           handle->type, WINSYS_HANDLE_TYPE_FD);
 
    if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
       ret = grate_bo_get_handle(resource->bo, &handle->handle);
@@ -51,22 +62,27 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
       }
    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
       ret = grate_bo_export(resource->bo, 0);
-      if (0 < ret) {
+      fprintf(stderr, "grate_bo_export returned: %d\n", ret);
+      if (ret > 0) {
          handle->handle = ret;
       } else {
-         fprintf(stderr, "grate_bo_export() failed: %d\n", ret);
+         fprintf(stderr, "grate_bo_export() failed or returned invalid fd: %d\n", ret);
          return false;
       }
    } else {
-      fprintf(stdout, "unsupported handle type: %d\n", handle->type);
+      fprintf(stderr, "grate_resource_get_handle: unsupported handle type: %d\n", handle->type);
       return false;
    }
 
    handle->stride = resource->pitch;
    handle->offset = 0;
    handle->modifier = DRM_FORMAT_MOD_LINEAR;
+   
+   fprintf(stderr, "grate_resource_get_handle: SUCCESS (handle=%u, stride=%u)\n", 
+           (unsigned)handle->handle, (unsigned)handle->stride);
    return true;
 }
+
 
 /*
  * DRI3 and the dmabuf export path ask for the layout through this rather than
@@ -211,9 +227,9 @@ grate_pixel_format(enum pipe_format format)
       return TGR3D_SURF_FORMAT_A8;
    case PIPE_FORMAT_L8_UNORM:
       return TGR3D_SURF_FORMAT_L8;
-    case PIPE_FORMAT_S8_UINT:
+   case PIPE_FORMAT_S8_UINT:
       return TGR3D_SURF_FORMAT_S8;
-    case PIPE_FORMAT_L8A8_UNORM:
+   case PIPE_FORMAT_L8A8_UNORM:
       return TGR3D_SURF_FORMAT_L8A8;
    case PIPE_FORMAT_B5G6R5_UNORM:
       return TGR3D_SURF_FORMAT_B5G6R5;
@@ -223,6 +239,8 @@ grate_pixel_format(enum pipe_format format)
       return TGR3D_SURF_FORMAT_A4B4G4R4;
    case PIPE_FORMAT_Z16_UNORM:
       return TGR3D_SURF_FORMAT_Z16;
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
       return TGR3D_SURF_FORMAT_R8G8B8A8;
@@ -362,6 +380,10 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
       return NULL;
    }
 
+fprintf(stderr,
+        "TEXTURE FORMAT %s\n",
+        util_format_short_name(template->format));
+
    return &resource->b;
 }
 
@@ -418,11 +440,34 @@ fail:
    return NULL;
 }
 
+
+static struct pipe_resource *
+grate_screen_resource_create_with_modifiers(struct pipe_screen *pscreen,
+                                            const struct pipe_resource *template,
+                                            const uint64_t *modifiers,
+                                            int count)
+{
+   bool linear_supported = false;
+   for (int i = 0; i < count; i++) {
+      if (modifiers[i] == DRM_FORMAT_MOD_LINEAR || modifiers[i] == DRM_FORMAT_MOD_INVALID) {
+         linear_supported = true;
+         break;
+      }
+   }
+
+   if (!linear_supported)
+      return NULL;
+
+   return grate_screen_resource_create(pscreen, template);
+}
+
+
 void
 grate_screen_resource_init(struct pipe_screen *pscreen)
 {
    grate_trace();
    pscreen->resource_create = grate_screen_resource_create;
+   pscreen->resource_create_with_modifiers = grate_screen_resource_create_with_modifiers;
    pscreen->resource_from_handle = grate_screen_resource_from_handle;
    pscreen->resource_get_handle = grate_resource_get_handle;
    pscreen->resource_get_param = grate_resource_get_param;

@@ -41,6 +41,7 @@ files_libgrate = files(
   'grate_draw.c',
   'grate_draw.h',
   'grate_nir.c',
+  'grate_nir_passes.c',
   'grate_program.c',
   'grate_program.h',
   'grate_resource.c',

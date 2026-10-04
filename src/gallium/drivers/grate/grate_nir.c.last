@@ -9,7 +9,6 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 
-
 #include "grate_nir.h"
 
 /* io is addressed in whole vec4 slots, one per location */
@@ -17,36 +16,6 @@ static unsigned
 grate_type_size(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
-}
-
-static bool
-lower_math_instr(struct nir_builder *b, nir_instr *instr, void *data)
-{
-   if (instr->type != nir_instr_type_alu)
-      return false;
-
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   b->cursor = nir_before_instr(instr);
-
-   if (alu->op == nir_op_fsqrt) {
-      // fsqrt(x) -> x * frsq(x)
-      nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
-      nir_def *rsq = nir_frsq(b, src);
-      nir_def *res = nir_fmul(b, src, rsq);
-      nir_def_rewrite_uses(&alu->def, res);
-      return true;
-   }
-
-   if (alu->op == nir_op_ffract) {
-      // ffract(x) -> x - ffloor(x)
-      nir_def *src = nir_ssa_for_alu_src(b, alu, 0);
-      nir_def *flr = nir_ffloor(b, src);
-      nir_def *res = nir_fsub(b, src, flr);
-      nir_def_rewrite_uses(&alu->def, res);
-      return true;
-   }
-
-   return false;
 }
 
 static void
@@ -88,17 +57,14 @@ grate_nir_lower_vs(nir_shader *s)
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             grate_type_size, 0);
 
-/* Invert V texture coordinate to match hardware origin conventions */
-//   grate_nir_invert_texcoord_v(s);
-
+   NIR_PASS(_, s, nir_lower_pow);
+   NIR_PASS(_, s, nir_lower_fdiv);
+   NIR_PASS(_, s, nir_opt_algebraic);
    /* uniforms stay as load_uniform: the vertex unit has one flat constant
     * file and no notion of a buffer to load from */
-
-
    grate_nir_optimize(s);
 
    NIR_PASS(_, s, nir_lower_bool_to_float, true);
-
    grate_nir_optimize(s);
 
    NIR_PASS(_, s, nir_convert_from_ssa, true, false);
@@ -131,20 +97,15 @@ grate_nir_lower_fs(nir_shader *s)
    /* the ALU has no lerp, only multiply-add */
    NIR_PASS(_, s, nir_lower_flrp, 32, false);
 
-/* Lower fsqrt and ffract into primitive operations */
-NIR_PASS(_, s, nir_shader_instructions_pass, lower_math_instr,
-            nir_metadata_none, NULL);
-
-/* Lower power operations to log2/exp2 expansions */
-//   NIR_PASS(_, s, nir_lower_pow);
-
    /* there are no booleans here, so a compare has to produce 1.0 or 0.0
     * directly rather than a bool that something later converts */
    NIR_PASS(_, s, nir_lower_bool_to_float, true);
 
    /* the fragment ALU is scalar, so give it scalar work */
    NIR_PASS(_, s, nir_lower_alu_to_scalar, NULL, NULL);
-
+   NIR_PASS(_, s, nir_lower_pow);
+   NIR_PASS(_, s, nir_lower_fdiv);
+   NIR_PASS(_, s, nir_opt_algebraic);
    grate_nir_optimize(s);
 
    NIR_PASS(_, s, nir_convert_from_ssa, true, false);
@@ -155,4 +116,3 @@ NIR_PASS(_, s, nir_shader_instructions_pass, lower_math_instr,
    if (getenv("GRATE_NIR_DUMP"))
       nir_print_shader(s, stderr);
 }
-

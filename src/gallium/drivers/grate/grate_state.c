@@ -66,7 +66,14 @@ static void grate_add_render_target(struct grate_context *context,
    unsigned rlvl = MIN2(ref->level, (unsigned)(GRATE_MAX_MIP_LEVELS - 1));
    unsigned rpitch = res->level_pitch[rlvl] ? res->level_pitch[rlvl] : res->pitch;
 
-   rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
+int hw_fmt = grate_pixel_format(ref->format);
+   if (hw_fmt <  0) {
+      fprintf(stderr, "%s: unsupported render target format: %s\n",
+              __func__, util_format_short_name(ref->format));
+      assert(0);
+   }
+
+   rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(hw_fmt);
    rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(rpitch);
    rt_params |= TGR3D_GLOBAL_SURFDESC_STRUCTURE(res->tiled);
    
@@ -759,8 +766,16 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
       bool mip_linear = smp && smp->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
       bool mipmapped  = smp && smp->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
 
+      enum pipe_format format = view->format;
+      int hw_fmt = grate_pixel_format(format);
+      if (hw_fmt < 0) {
+         fprintf(stderr, "%s: unsupported texture format: %s\n",
+                 __func__, util_format_short_name(format));
+         assert(0);
+      }
 
-      uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format);
+      uint32_t lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(hw_fmt);
+
       if (mag_linear)
          lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
       if (min_linear)
