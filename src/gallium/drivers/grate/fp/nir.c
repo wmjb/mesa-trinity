@@ -1210,7 +1210,15 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
 fp->info.num_varyings = 0;
 
 nir_foreach_shader_in_variable(var, s) {
-      unsigned row = var->data.driver_location + 1 ; //plus one
+/*
+   On Tegra's 3D hardware pipeline (GR3D), fragment inputs (varyings) are passed through an on-chip interpolation buffer 
+      known as the TRAM.Row 0 of this buffer is hard-allocated and reserved by the hardware engine itself for built-in 
+      attributes—specifically fragment position, window coordinates (WPOS / gl_FragCoord), or homogeneous $W$.Because the 
+   hardware unconditionally hijacks row 0 for position data, user-defined varyings and texture coordinates cannot start at 
+   index 0. They must be shifted down by one slot, starting at row 1 (driver_location + 1).
+  */
+   
+   unsigned row = var->data.driver_location + 1 ; //plus one
 
 fprintf(stderr,
         "FP INPUT location=%d driver_location=%d name=%s\n",
