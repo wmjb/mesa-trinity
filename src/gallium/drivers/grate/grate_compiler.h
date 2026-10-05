@@ -31,10 +31,15 @@ struct grate_fp_info {
       uint32_t src;
       uint32_t dst;
    } inputs[16];
+struct {
+unsigned location;
+int row;
+} varying_map[16];
+int num_varyings;
    int num_inputs;
    int color_input;
-   int texcoord_row;
    int max_tram_row;
+
 };
 
 /* TGSI immediates the shader declared, resolved to ALU operands at emit time */

@@ -158,6 +158,32 @@ fp_constant(struct fp_nir_ctx *ctx, float v)
    return 28 + ctx->num_constants++;
 }
 
+
+static int
+fp_lookup_varying_row(struct grate_fp_info *info,
+                      unsigned location)
+{
+   for (int i = 0; i < info->num_varyings; i++) {
+      if (info->varying_map[i].location == location){
+
+fprintf(stderr,
+"FP MAP HIT location=%u row=%d\n",
+ location,
+info->varying_map[i].row);
+
+         return info->varying_map[i].row;
+   }
+}
+
+fprintf(stderr,
+ "FP MAP MISS location=%u\n",
+ location);
+
+   return -1;
+}
+
+
+
 static struct fp_alu_src_operand
 fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
 {
@@ -190,15 +216,15 @@ fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input: {
-         unsigned row = nir_intrinsic_base(intr);
-         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+int row = nir_intrinsic_base(intr);
+nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
 
-if ((sem.location == VARYING_SLOT_VAR0 ||
-              (sem.location >= VARYING_SLOT_TEX0 &&
-               sem.location <= VARYING_SLOT_TEX7)) &&
-             ctx->fp->info.texcoord_row >= 0) {
-             row = ctx->fp->info.texcoord_row;
-         }
+int mapped_row =
+fp_lookup_varying_row(&ctx->fp->info,
+sem.location);
+
+if (mapped_row >= 0)
+row = mapped_row;
 
          /* interpolated by the instruction being built: the copy of it does
           * not exist until this instruction ends, so read the row register */
@@ -879,90 +905,116 @@ fp_emit_store_output(struct fp_nir_ctx *ctx, nir_intrinsic_instr *intr)
    }
 }
 
+
+static int
+fp_find_varying_row(struct fp_nir_ctx *ctx, nir_instr *instr)
+{
+   while (instr) {
+
+      if (instr->type == nir_instr_type_intrinsic) {
+
+         nir_intrinsic_instr *intr =
+            nir_instr_as_intrinsic(instr);
+
+         if (intr->intrinsic == nir_intrinsic_load_input ||
+             intr->intrinsic ==
+                nir_intrinsic_load_interpolated_input) {
+
+            nir_io_semantics sem =
+               nir_intrinsic_io_semantics(intr);
+
+            int row =
+               fp_lookup_varying_row(&ctx->fp->info,
+                                     sem.location);
+
+            fprintf(stderr,
+                    "FP FIND location=%d row=%d\n",
+                    sem.location,
+                    row);
+
+
+            return row ;
+         }
+      }
+
+      if (instr->type == nir_instr_type_alu) {
+
+         nir_alu_instr *alu =
+            nir_instr_as_alu(instr);
+
+         if (alu->op == nir_op_vec2 ||
+             alu->op == nir_op_vec3 ||
+             alu->op == nir_op_vec4) {
+
+            instr =
+               nir_def_instr(alu->src[0].src.ssa);
+
+            continue;
+         }
+      }
+
+      break;
+   }
+
+   return -1;
+}
+
 static void
 fp_emit_tex(struct fp_nir_ctx *ctx, nir_tex_instr *tex)
 {
    struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
+
    inst->tex.enable = true;
    inst->tex.sampler = tex->sampler_index;
    inst->tex.dst_r2_r3 = true;
    inst->tex.src_r2_r3 = false;
 
-   unsigned coord_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   nir_src *coord_src = &tex->src[coord_src_idx].src;
+   unsigned coord_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_coord);
 
-   /* ===== TRACE BACK TO THE ACTUAL VARYING SOURCE ===== */
-   nir_def *def = coord_src->ssa;
-   nir_instr *coord_instr = nir_def_instr(def);
+   nir_src *coord_src =
+      &tex->src[coord_src_idx].src;
 
-   unsigned row = ctx->fp->info.texcoord_row;
-   bool found_source = false;
+   int row =
+      fp_find_varying_row(ctx,
+                          nir_def_instr(coord_src->ssa));
 
-   /* Walk through vec2/vec3/vec4 constructors to find the load_input underneath */
-   while (!found_source && coord_instr) {
-      if (coord_instr->type == nir_instr_type_intrinsic) {
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(coord_instr);
-         if (intr->intrinsic == nir_intrinsic_load_input ||
-             intr->intrinsic == nir_intrinsic_load_interpolated_input) {
-
-nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
-              if (sem.location == VARYING_SLOT_VAR0 ||
-                  (sem.location >= VARYING_SLOT_TEX0 &&  // watch typo: VARYING_SLOT_TEX0
-                   sem.location <= VARYING_SLOT_TEX7)) {
-                  row = ctx->fp->info.texcoord_row;
-                  found_source = true;
-                  fprintf(stderr, ">>> GRATE-FP: Found texcoord source row=%u\n", row);
-                  fflush(stderr);
-              }
-
-             break;
-         }
-      }
-      /* Follow vecN sources back to their origin */
-      if (coord_instr->type == nir_instr_type_alu) {
-         nir_alu_instr *alu = nir_instr_as_alu(coord_instr);
-         if (alu->op == nir_op_vec2 || alu->op == nir_op_vec3 || alu->op == nir_op_vec4) {
-             /* Follow first source (X component) back — both come from same varying */
-             def = alu->src[0].src.ssa;
-             coord_instr = nir_def_instr(def);
-             continue;
-         }
-      }
-      break; /* Reached something else — stop */
+   if (row < 0) {
+      fprintf(stderr,
+              "GRATE-FP: failed to resolve TEX coordinate varying\n");
+      row = 0;
    }
 
-   if (!found_source) {
-      fprintf(stderr, ">>> GRATE-FP: Using texcoord_row=%u (direct or fallback)\n", row);
-      fflush(stderr);
-   }
-   /* =================================================== */
+   fprintf(stderr,
+           ">>> GRATE-FP: TEX coordinate row=%d\n",
+           row);
 
+   struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
+   list_inithead(&mfu->link);
 
-/* BOTH S and T from consecutive rows of the vector attribute */
-   if (ctx->fp->info.texcoord_row >= 0) {
-      struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
-      list_inithead(&mfu->link);
+   mfu->var[0].op = FP_VAR_OP_FP20;
+   mfu->var[0].tram_row = row;
 
-      /* S = component 0 (row) */
-      mfu->var[0].op = FP_VAR_OP_FP20;
-      mfu->var[0].tram_row = row;
+   mfu->var[1].op = FP_VAR_OP_FP20;
+   mfu->var[1].tram_row = row;
 
-      /* T = component 1 (row) */
-      mfu->var[1].op = FP_VAR_OP_FP20;
-      mfu->var[1].tram_row = row;
+   mfu->var[2].op = FP_VAR_OP_FP20;
+   mfu->var[2].tram_row = row;
 
-      /* R = component 2 (row) if needed, or leave NOP/same */
-      mfu->var[2].op = FP_VAR_OP_FP20;
-      mfu->var[2].tram_row = row;
+   ctx->fp->info.max_tram_row =
+      MAX2(ctx->fp->info.max_tram_row, row);
 
-      ctx->fp->info.max_tram_row = MAX2(ctx->fp->info.max_tram_row, row);
-      inst->mfu_sched.address = list_length(&ctx->fp->mfu_instructions);
-      inst->mfu_sched.num_instructions = 1;
-      list_addtail(&mfu->link, &ctx->fp->mfu_instructions);
-   }
+   inst->mfu_sched.address =
+      list_length(&ctx->fp->mfu_instructions);
 
+   inst->mfu_sched.num_instructions = 1;
 
-   list_addtail(&inst->link, &ctx->fp->fp_instructions);
+   list_addtail(&mfu->link,
+                &ctx->fp->mfu_instructions);
+
+   list_addtail(&inst->link,
+                &ctx->fp->fp_instructions);
+
    ctx->tex_def = &tex->def;
 }
 
@@ -1139,8 +1191,6 @@ fp_release_use(nir_src *src, void *data)
    return true;
 }
 
-
-
 void
 grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
 {
@@ -1156,35 +1206,45 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
    fp->info.num_inputs = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
-   fp->info.texcoord_row = -1;
+
+fp->info.num_varyings = 0;
 
 nir_foreach_shader_in_variable(var, s) {
-      unsigned row = var->data.driver_location; //plus one
-      bool is_texcoord = false;
+      unsigned row = var->data.driver_location + 1 ; //plus one
 
-      if (var->data.location == VARYING_SLOT_VAR0 ||
-          (var->data.location >= VARYING_SLOT_TEX0 &&
-           var->data.location <= VARYING_SLOT_TEX7)) {
+fprintf(stderr,
+        "FP INPUT location=%d driver_location=%d name=%s\n",
+        var->data.location,
+        var->data.driver_location,
+        var->name ? var->name : "(null)");
 
-         if (var->data.location != VARYING_SLOT_VAR0 ||
-             !var->name || strcmp(var->name, "Color") != 0) {
-             is_texcoord = true;
-         }
+if (var->data.location == VARYING_SLOT_COL0)
+   fp->info.color_input = row;
 
-         var->data.interpolation = INTERP_MODE_SMOOTH;
-      }
 
-      if (var->data.location == VARYING_SLOT_COL0)
-         fp->info.color_input = row;
+if (fp->info.num_varyings <
+    ARRAY_SIZE(fp->info.varying_map)) {
 
-      if (is_texcoord) {
-         fp->info.texcoord_row = row;
-         fprintf(stderr, ">>> GRATE-FP: texcoord_row = %u\n", row);
-      }
+   fp->info.varying_map[fp->info.num_varyings].location =
+      var->data.location + 1;
 
-      fprintf(stderr, ">>> GRATE-FP: input loc=%d row=%u name=%s\n",
-              var->data.location, row, var->name ? var->name : "(null)");
-      fflush(stderr);
+   fp->info.varying_map[fp->info.num_varyings].row =
+      row;
+
+fprintf(stderr,
+"FP MAP ADD location=%d row=%u\n",
+var->data.location,
+row);
+
+   fp->info.num_varyings++;
+}
+
+fprintf(stderr,
+        ">>> GRATE-FP: input loc=%d row=%u name=%s\n",
+        var->data.location,
+        row,
+        var->name ? var->name : "(null)");
+
 
       unsigned n = glsl_get_vector_elements(glsl_without_array(var->type));
       uint32_t dst = 0;
@@ -1192,7 +1252,7 @@ nir_foreach_shader_in_variable(var, s) {
          dst |= LINK_DST(i, i, LINK_DST_FP20);
 
       if (fp->info.num_inputs < ARRAY_SIZE(fp->info.inputs)) {
-         fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(row +1);
+         fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(row);
          fp->info.inputs[fp->info.num_inputs].dst = dst;
          fp->info.num_inputs++;
       }

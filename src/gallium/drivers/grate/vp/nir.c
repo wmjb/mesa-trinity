@@ -325,8 +325,8 @@ vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
       vp_push(ctx->vp, v, vp_snop());
    }
 }
-*/
 
+*/
 
 static void
 vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
@@ -348,7 +348,6 @@ vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
 
       struct vp_src_operand src = vp_src(ctx, alu->src[src_idx].src, alu->src[src_idx].swizzle);
 
-      /* Explicitly enforce the component swizzle from NIR */
       unsigned swz_elem = alu->src[src_idx].swizzle[0];
       for (int c = 0; c < 4; ++c)
          src.swizzle[c] = (enum vp_swz)swz_elem;
@@ -370,6 +369,7 @@ vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
       vp_nir_push(ctx, v, vp_snop()); 
   }
 }
+
 
 static void
 vp_emit_alu(struct vp_nir_ctx *ctx, nir_alu_instr *alu)
@@ -454,9 +454,14 @@ case nir_intrinsic_store_output: {
 
       fprintf(stderr, ">>> GRATE-VP: store_output loc=%d base=%d mask=%x\n",
               sem.location, base, write_mask);
-      fflush(stderr);
 
       struct vp_src_operand s = vp_src(ctx, intr->src[0], NULL);
+
+fprintf(stderr,
+        "VP OUT SRC temp=%d location=%d base=%d\n",
+        s.index,
+        sem.location,
+        base);
 
       /*
        * For VARYING_SLOT_VAR0, the vector contains [lighting, S, T] at components [0, 1, 2].
