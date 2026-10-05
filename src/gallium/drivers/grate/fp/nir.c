@@ -1215,7 +1215,9 @@ nir_foreach_shader_in_variable(var, s) {
       known as the TRAM.Row 0 of this buffer is hard-allocated and reserved by the hardware engine itself for built-in 
       attributes—specifically fragment position, window coordinates (WPOS / gl_FragCoord), or homogeneous $W$.Because the 
    hardware unconditionally hijacks row 0 for position data, user-defined varyings and texture coordinates cannot start at 
-   index 0. They must be shifted down by one slot, starting at row 1 (driver_location + 1).
+   index 0. They must be shifted down by one slot, starting at row 1 (driver_location + 1). Gallium state tracker has no 
+   concept of NVIDIA Tegra's GR3D hardware architecture, nor does it know that TRAM Row 0 is permanently hijacked by the 
+   silicon and the frontend knows nothing about Tegra's physical constraints, it assigns driver_location sequentially starting from 0.
   */
    
    unsigned row = var->data.driver_location + 1 ; //plus one
