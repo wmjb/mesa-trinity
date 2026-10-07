@@ -166,15 +166,25 @@ grate_set_viewport_states(struct pipe_context *pcontext,
 {
    struct grate_context *context = grate_context(pcontext);
    static const float zeps = powf(2.0f, -21);
-   unsigned int hw_scale;
 
-   if (context->drm->soc_id == DRM_TEGRA_SOC_T114)
-      hw_scale = 0xFFFFFF;
-   else
-      hw_scale = 0xFFFFF;
+   /* Determine Z hardware integer range from active depth surface format */
+   struct pipe_framebuffer_state *fb = &context->framebuffer.base;
+   float hw_scale = 65535.0f; /* default 16-bit z16_unorm */
+
+   if (fb->zsbuf.texture) {
+      if (fb->zsbuf.format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+          fb->zsbuf.format == PIPE_FORMAT_Z24X8_UNORM) {
+         hw_scale = (context->drm->soc_id == DRM_TEGRA_SOC_T114) ? 16777215.0f : 1048575.0f;
+      } else if (fb->zsbuf.format == PIPE_FORMAT_Z16_UNORM) {
+         hw_scale = 65535.0f;
+      }
+   }
 
    assert(num_viewports == 1);
    assert(start_slot == 0);
+
+   float z_scale = viewports[0].scale[2] * hw_scale;
+   float z_bias  = viewports[0].translate[2] * hw_scale;
 
    context->viewport[0] = host1x_opcode_incr(REG_TGR3D_SU_VIEWPORT_X, 6);
    context->viewport[1] = u_bitcast_f2u(viewports[0].translate[0] * 16.0f);
@@ -184,11 +194,15 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->viewport[5] = u_bitcast_f2u(viewports[0].scale[1] * 16.0f);
    context->viewport[6] = u_bitcast_f2u(viewports[0].scale[2] - zeps);
 
-   uint32_t depth_near = (viewports[0].translate[2] - viewports[0].scale[2]) * hw_scale;
-   uint32_t depth_far = (viewports[0].translate[2] + viewports[0].scale[2]) * hw_scale;
+   float d_near = viewports[0].translate[2] - viewports[0].scale[2];
+   float d_far  = viewports[0].translate[2] + viewports[0].scale[2];
+
+   uint32_t depth_near = CLAMP(d_near * hw_scale, 0.0f, (float)hw_scale);
+   uint32_t depth_far  = CLAMP(d_far  * hw_scale, 0.0f, (float)hw_scale);
+
    context->viewport[7] = host1x_opcode_incr(REG_TGR3D_QR_Z_MIN, 2);
-   context->viewport[8] = depth_near;
-   context->viewport[9] = depth_far;
+   context->viewport[8] = MIN2(depth_near, depth_far);
+   context->viewport[9] = MAX2(depth_near, depth_far);
 
    assert(viewports[0].scale[0] >= 0.0f);
    float max_x = fabs(viewports[0].translate[0]);
@@ -200,12 +214,16 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->guardband[2] = u_bitcast_f2u((3967 - max_y) / scale_y);
    context->guardband[3] = u_bitcast_f2u(6.99);
 
+   /* Flag VPM dirty if Y-inversion state toggles */
+   bool old_y_invert = context->y_invert;
    context->y_invert = viewports[0].scale[1] < 0.0f;
+   if (old_y_invert != context->y_invert)
+      context->dirty |= GRATE_DIRTY_VPM;
 
    if (getenv("GRATE_VP_TRACE"))
-      fprintf(stderr, "grate: viewport translate=(%.1f,%.1f) scale=(%.1f,%.1f) y_invert=%d\n",
+      fprintf(stderr, "grate: viewport translate=(%.1f,%.1f) scale=(%.1f,%.1f) y_invert=%d hw_scale=%.0f z_bias=%.1f z_scale=%.1f\n",
               viewports[0].translate[0], viewports[0].translate[1],
-              viewports[0].scale[0], viewports[0].scale[1], context->y_invert);
+              viewports[0].scale[0], viewports[0].scale[1], context->y_invert, hw_scale, z_bias, z_scale);
 }
 
 static void
@@ -420,25 +438,21 @@ grate_context_sampler_init(struct pipe_context *pcontext)
    pcontext->sampler_view_release = u_default_sampler_view_release;
 }
 
-static int
-grate_cull_face(int cull_face, bool front_ccw)
+static uint32_t
+grate_cull_face(unsigned cull_face)
 {
    switch (cull_face) {
    case PIPE_FACE_NONE:
-      return TGR3D_CULL_NONE;
-
-   case PIPE_FACE_FRONT:
-      return front_ccw ? TGR3D_CULL_POS : TGR3D_CULL_NEG;
-
+      return 0;
    case PIPE_FACE_BACK:
-      return front_ccw ? TGR3D_CULL_NEG : TGR3D_CULL_POS;
-
+      return 1; /* Hardware mode 1: Cull Back */
+   case PIPE_FACE_FRONT:
+      return 2; /* Hardware mode 2: Cull Front */
    case PIPE_FACE_FRONT_AND_BACK:
-      return TGR3D_CULL_BOTH;
-
-   default:
-      UNREACHABLE("unknown cull_face");
+      return 3;
    }
+
+   return 0;
 }
 
 static void *
@@ -450,18 +464,15 @@ grate_create_rasterizer_state(struct pipe_context *pcontext,
       return NULL;
 
    so->base = *template;
-
    so->draw_params = TGR3D_IDX_SET_PRIM_FLAT_VTX(!template->flatshade_first);
 
-   /* normal */
-   so->cull_face[0] = TGR3D_SU_PARAM_FRONT_FACE(!template->front_ccw);
-   so->cull_face[0] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
-                                           template->front_ccw));
+   /* normal (y_invert = 0): front face is template->front_ccw */
+   so->cull_face[0] = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw) |
+                      TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face));
 
-   /* y-inverted */
-   so->cull_face[1] = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw);
-   so->cull_face[1] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
-                                           !template->front_ccw));
+   /* y-inverted (y_invert = 1): invert front face winding due to Y-flip */
+   so->cull_face[1] = TGR3D_SU_PARAM_FRONT_FACE(!template->front_ccw) |
+                      TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face));
 
    return so;
 }
@@ -538,12 +549,16 @@ grate_create_zsa_state(struct pipe_context *pcontext,
     * corrupt. The state is still translated so that turning the switch on is
     * all it takes to carry on investigating.
     */
+
    bool hw_depth = getenv("GRATE_HW_DEPTH") != NULL;
 
+   bool z_enable = hw_depth && template->depth_enabled;
+   bool z_write  = hw_depth && template->depth_enabled && template->depth_writemask;
+
    depth_test |= TGR3D_QR_Z_TEST_Z_FUNC(grate_compare_func(template->depth_func));
-   depth_test |= TGR3D_QR_Z_TEST_Z_ENABLE(hw_depth && template->depth_enabled);
-   depth_test |= TGR3D_QR_Z_TEST_QRAST_FB_WRITE(hw_depth && template->depth_writemask);
-   depth_test |= TGR3D_QR_Z_TEST_Z_CLAMP(TGR3D_Z_CLAMP_KILL);
+   depth_test |= TGR3D_QR_Z_TEST_Z_ENABLE(z_enable);
+   depth_test |= TGR3D_QR_Z_TEST_QRAST_FB_WRITE(z_write);
+   depth_test |= TGR3D_QR_Z_TEST_Z_CLAMP(TGR3D_Z_CLAMP_CLAMP);
 
    so->commands[0] = host1x_opcode_incr(REG_TGR3D_QR_Z_TEST, 1);
    so->commands[1] = depth_test;
@@ -746,11 +761,12 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
 
    for (unsigned i = 0; i < num; ++i) {
       struct pipe_sampler_view *view = context->sampler_views[i];
-      if (!view || !view->texture)
+      struct pipe_sampler_state *smp = context->samplers[i];
+
+      if (!view)
          continue;
 
       struct grate_resource *res = grate_resource(view->texture);
-      const struct pipe_sampler_state *smp = context->samplers[i];
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
       grate_stream_push_reloc(stream, ptrp, res->bo, 0);
@@ -792,31 +808,16 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
       }
 
       uint32_t hi = 0;
-      /*
-       * Mip levels have storage but the descriptor has no per-level address,
-       * so where the sampler looks for level 1 is not known. Until it is,
-       * always sample level 0: minification aliases, which is a blemish, and
-       * letting the sampler loose on levels it cannot find hangs the GPU.
-       */
-      /*
-       * NORMALIZE is normalized texture coordinates, which is what GL always
-       * wants; it was being used as a mipmap disable, so a mipmapped texture
-       * lost normalized coordinates as well. BASE_LEVEL_ONLY is the bit that
-       * actually restricts sampling to level 0.
-       */
-      hi |= TGR3D_TEX_TEXDESC_HI_NORMALIZE__MASK;
 
-      /*
-       * Levels now have storage and are uploaded to the right place, but the
-       * sampler never picks one: with LOD_MIN/LOD_MAX set and LERP_MIP on, a
-       * texture whose levels are flat distinct colours still reads level 0 at
-       * every minification, where softpipe picks levels 2 and 4
-       * (tests/miptest). The descriptor carries no per-level address, so where
-       * the sampler expects to find level 1 is still unknown. Sample level 0
-       * and say so, rather than leave minification reading somewhere random.
+       /*
+       * Only set NORMALIZE when requested by the sampler state.
+       * Unnormalized coordinates (e.g. st/drawtex) require NORMALIZE to be 0
+       * so texels are indexed directly by pixel offsets.
        */
-      (void)mipmapped;
-      (void)mip_linear;
+      bool normalized = !smp || !smp->unnormalized_coords;
+      if (normalized)
+         hi |= TGR3D_TEX_TEXDESC_HI_NORMALIZE__MASK;
+
       hi |= TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY__MASK;
 
       if (pot) {
@@ -826,7 +827,6 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
          hi |= GRATE_TEXDESC_HI_NOT_POW2;
          hi |= TGR3D_TEX_TEXDESC_HI_WIDTH(width);
          hi |= TGR3D_TEX_TEXDESC_HI_HEIGHT(height);
-
       }
 
       if (grate_debug & GRATE_DEBUG_TRACE)
@@ -1011,6 +1011,24 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    grate_stream_push_words(stream, ptrp, linker_insts, ARRAY_SIZE(linker_insts), 0);
 }
 
+static void
+emit_rasterizer_state(struct grate_context *context, uint32_t **ptrp)
+{
+   if (!(context->dirty & GRATE_DIRTY_VPM))
+      return;
+
+   struct grate_rasterizer_state *rast = context->rast;
+   if (!rast)
+      return;
+
+   uint32_t *ptr = *ptrp;
+
+   GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_SU_PARAM, 1));
+   GRATE_PUSHBUF_WORD(ptr, rast->cull_face[context->y_invert]);
+
+   *ptrp = ptr;
+}
+
 void
 grate_emit_state(struct grate_context *context, uint32_t **ptrp)
 {
@@ -1018,6 +1036,7 @@ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
    emit_viewport(context, ptrp);
    emit_guardband(context, ptrp);
    emit_scissor(context, ptrp);
+   emit_rasterizer_state(context, ptrp);
    emit_zsa_state(context, ptrp);
    emit_attribs(context, ptrp);
    emit_vs_uniforms(context, ptrp);

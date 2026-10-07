@@ -109,7 +109,12 @@ static void
 grate_bind_vs_state(struct pipe_context *pcontext, void *so)
 {
    grate_trace();
-   grate_context(pcontext)->vshader = so;
+   struct grate_context *context = grate_context(pcontext);
+
+   if (context->vshader != so) {
+      context->vshader = so;
+      context->dirty |= GRATE_DIRTY_VPM;
+   }
 }
 
 static void
@@ -134,6 +139,8 @@ grate_create_fs_state(struct pipe_context *pcontext,
    so->base = *template;
 
    struct grate_fp_shader fp;
+
+
 
    grate_nir_lower_fs(template->ir.nir);
    grate_nir_to_fp(&fp, template->ir.nir);
@@ -291,17 +298,17 @@ grate_create_fs_state(struct pipe_context *pcontext,
       dw.index += context->framebuffer.rt_base;
       PUSH(grate_fp_pack_dw(&dw));
    }
-/*
+
    uint32_t tram_setup = 0;
    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_NUM_TRIS(64 / fp.info.max_tram_row);
    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_TRI_ROWS(fp.info.max_tram_row);
-*/
+/*
 
    uint32_t num_tram_rows = fp.info.max_tram_row + 1;
    uint32_t tram_setup = 0;
    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_NUM_TRIS(64 / num_tram_rows);
    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_TRI_ROWS(num_tram_rows);
-
+*/
    PUSH(host1x_opcode_incr(REG_TGR3D_GLOBAL_TRI_ATTR, 1));
    PUSH(tram_setup);
 
@@ -318,7 +325,12 @@ static void
 grate_bind_fs_state(struct pipe_context *pcontext, void *so)
 {
    grate_trace();
-   grate_context(pcontext)->fshader = so;
+   struct grate_context *context = grate_context(pcontext);
+
+   if (context->fshader != so) {
+      context->fshader = so;
+      context->dirty |= GRATE_DIRTY_VPM;
+   }
 }
 
 static void

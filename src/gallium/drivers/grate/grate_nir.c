@@ -9,7 +9,6 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 
-
 #include "grate_nir.h"
 
 /* io is addressed in whole vec4 slots, one per location */
@@ -68,6 +67,61 @@ grate_nir_optimize(nir_shader *s)
    } while (progress);
 }
 
+static bool
+swizzle_packed_varying_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   
+   if (intrin->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   unsigned location = nir_intrinsic_io_semantics(intrin).location;
+
+   /* 
+    * GUARD 1: Never swizzle standard color varyings.
+    * This protects non-textured items from turning the wrong color.
+    */
+   if (location == VARYING_SLOT_COL0 || location == VARYING_SLOT_COL1)
+      return false;
+
+   /* 
+    * GUARD 2: Target the exact slot containing the packed S, T, Lighting data.
+    * 
+    * TODO: You need to replace VARYING_SLOT_TEX0 with whichever semantic 
+    * slot the Mesa state tracker (or your varying linker) is assigning to 
+    * this packed data.
+    */
+//   if (location != VARYING_SLOT_TEX0 && location != VARYING_SLOT_VAR0)
+   if (location != VARYING_SLOT_VAR0)
+      return false;
+
+   nir_def *orig_val = intrin->src[0].ssa;
+   
+   /* If we found our packed vec3, apply the hardware swizzle */
+   if (orig_val->num_components == 3) {
+      b->cursor = nir_before_instr(instr);
+
+      /* map[3] = { 1, 2, 0 } */
+      unsigned swizzle[3] = {1, 2, 0};
+      nir_def *swizzled = nir_swizzle(b, orig_val, swizzle, 3);
+      
+      nir_src_rewrite(&intrin->src[0], swizzled);
+      return true;
+   }
+
+   return false;
+}
+static bool
+grate_nir_swizzle_packed_varying(nir_shader *s)
+{
+   return nir_shader_instructions_pass(s, swizzle_packed_varying_instr,
+                                       nir_metadata_block_index | nir_metadata_dominance,
+                                       NULL);
+}
+
 void
 grate_nir_lower_vs(nir_shader *s)
 {
@@ -87,6 +141,9 @@ grate_nir_lower_vs(nir_shader *s)
 
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             grate_type_size, 0);
+
+/* Insert the swizzle pass here, after IO is lowered */
+//   NIR_PASS(_, s, grate_nir_swizzle_packed_varying);
 
 /* Invert V texture coordinate to match hardware origin conventions */
 //   grate_nir_invert_texcoord_v(s);
@@ -125,8 +182,21 @@ grate_nir_lower_fs(nir_shader *s)
    NIR_PASS(_, s, nir_lower_global_vars_to_local);
    NIR_PASS(_, s, nir_lower_vars_to_ssa);
 
+/* Align fragment shader input driver locations to start at row 1 for Tegra TRAM */
+
+
+   nir_foreach_shader_in_variable(var, s) {
+//      var->data.driver_location += 1;
+//      var->data.location += 1;
+   }
+
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             grate_type_size, 0);
+
+static const struct nir_lower_tex_options tex_options = {
+      .lower_rect = true,
+   };
+   NIR_PASS(_, s, nir_lower_tex, &tex_options);
 
    /* the ALU has no lerp, only multiply-add */
    NIR_PASS(_, s, nir_lower_flrp, 32, false);
@@ -151,6 +221,11 @@ NIR_PASS(_, s, nir_shader_instructions_pass, lower_math_instr,
    NIR_PASS(_, s, nir_opt_dce);
 
    nir_index_ssa_defs(nir_shader_get_entrypoint(s));
+
+   nir_foreach_shader_in_variable(var, s) {
+//       var->data.driver_location += 1;
+//       var->data.location += 1;
+   }
 
    if (getenv("GRATE_NIR_DUMP"))
       nir_print_shader(s, stderr);

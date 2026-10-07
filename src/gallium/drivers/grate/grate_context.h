@@ -33,6 +33,14 @@ struct grate_channel {
    struct grate_stream stream;
 };
 
+
+#define GRATE_DIRTY_VPM (1 << 0)
+
+struct grate_vpm_state {
+   unsigned num_attrs;
+   uint32_t vpm_attribs[16];
+};
+
 #define GRATE_MAX_SAMPLERS 16
 
 struct grate_context {
@@ -57,6 +65,9 @@ struct grate_context {
    struct grate_vertex_shader_state *vshader;
    struct grate_fragment_shader_state *fshader;
 
+   struct grate_vpm_state vpm;
+   uint32_t dirty;
+
    struct pipe_sampler_view *sampler_views[GRATE_MAX_SAMPLERS];
    struct pipe_sampler_state *samplers[GRATE_MAX_SAMPLERS];
    unsigned num_sampler_views;
@@ -68,6 +79,10 @@ struct grate_context {
    bool y_invert;
    struct pipe_scissor_state scissor;
 };
+
+
+void grate_update_vpm_state(struct grate_context *context);
+void grate_emit_vpm_state(struct grate_context *context, uint32_t **ptr);
 
 static inline struct grate_context *
 grate_context(struct pipe_context *context)

@@ -164,25 +164,30 @@ fp_lookup_varying_row(struct grate_fp_info *info,
                       unsigned location)
 {
    for (int i = 0; i < info->num_varyings; i++) {
-      if (info->varying_map[i].location == location){
-
-fprintf(stderr,
-"FP MAP HIT location=%u row=%d\n",
- location,
-info->varying_map[i].row);
-
+      /* Exact match check — remove the rogue '+ 1' */
+      if (info->varying_map[i].location == location) {
+         fprintf(stderr,
+                 "FP MAP HIT location=%u row=%d\n",
+                 location,
+                 info->varying_map[i].row);
          return info->varying_map[i].row;
+      }
    }
-}
 
-fprintf(stderr,
- "FP MAP MISS location=%u\n",
- location);
+   fprintf(stderr,
+           "FP MAP MISS location=%u\n",
+           location);
 
+   /* Must return -1 on miss so callers know lookup failed (0 is TRAM Row 0!) */
    return -1;
 }
 
-
+static int
+resolved_varying_row(struct grate_fp_info *info, nir_intrinsic_instr *intr)
+{
+   /* The hardware always requires the driver location + 1 offset */
+   return nir_intrinsic_base(intr) + 1;
+}
 
 static struct fp_alu_src_operand
 fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
@@ -216,59 +221,18 @@ fp_nir_src(struct fp_nir_ctx *ctx, nir_src src, unsigned comp)
       switch (intr->intrinsic) {
       case nir_intrinsic_load_input:
       case nir_intrinsic_load_interpolated_input: {
-int row = nir_intrinsic_base(intr);
-nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+         int row = nir_intrinsic_base(intr);
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
 
-int mapped_row =
-fp_lookup_varying_row(&ctx->fp->info,
-sem.location);
+//         int mapped_row = fp_lookup_varying_row(&ctx->fp->info, sem.location);
+//         if (mapped_row >= 0)
+//            row = mapped_row;
 
-if (mapped_row >= 0)
-row = mapped_row;
-
-         /* interpolated by the instruction being built: the copy of it does
-          * not exist until this instruction ends, so read the row register */
-         if (row < 16 && comp < 4 && ctx->cur_row[row][comp] >= 0) {
-            op.index = ctx->cur_row[row][comp];
-            return op;
-         }
-
-         if (row < 16 && comp < 4 && ctx->varying_slot[row][comp] >= 0 &&
-             !getenv("GRATE_FS_NOCOPY")) {
-            /* already interpolated once; read the copy that was kept */
-            op.index = fp_reg_for_slot(ctx, ctx->varying_slot[row][comp]);
-            op.datatype = FP_DATATYPE_FP20;
-            return op;
-         }
-
-         if (!ctx->mfu) {
-            ctx->mfu = CALLOC_STRUCT(fp_mfu_instr);
-            list_inithead(&ctx->mfu->link);
-         }
-
-         ctx->mfu->var[comp].op = FP_VAR_OP_FP20;
-         ctx->mfu->var[comp].tram_row = row;
-         ctx->fp->info.max_tram_row = MAX2(ctx->fp->info.max_tram_row, row);
-
-         /*
-          * Keep a copy: asking the MFU for the same varying again in a later
-          * instruction does not give the same answer, so a component read in
-          * two instructions would otherwise come back as two different values.
-          */
-         if (row < 16 && comp < 4 && ctx->num_keep < ARRAY_SIZE(ctx->keep)) {
-            struct fp_alu_src_operand from = { .index = comp };
-
-            ctx->keep[ctx->num_keep].src = from;
-            ctx->keep[ctx->num_keep].slot = fp_alloc_slot(ctx);
-            ctx->keep[ctx->num_keep].commit = &ctx->varying_slot[row][comp];
-            ctx->num_keep++;
-            ctx->cur_row[row][comp] = comp;
-         }
-
+         /* Direct read from MFU output stream s0..s3 */
          op.index = comp;
+         op.datatype = FP_DATATYPE_FP20;
          return op;
       }
-
       case nir_intrinsic_load_uniform: {
          unsigned base = nir_intrinsic_base(intr);
          unsigned off = nir_src_is_const(intr->src[0])
@@ -909,46 +873,35 @@ fp_emit_store_output(struct fp_nir_ctx *ctx, nir_intrinsic_instr *intr)
 static int
 fp_find_varying_row(struct fp_nir_ctx *ctx, nir_instr *instr)
 {
-   while (instr) {
+
+    while (instr) {
 
       if (instr->type == nir_instr_type_intrinsic) {
-
-         nir_intrinsic_instr *intr =
-            nir_instr_as_intrinsic(instr);
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
 
          if (intr->intrinsic == nir_intrinsic_load_input ||
-             intr->intrinsic ==
-                nir_intrinsic_load_interpolated_input) {
+             intr->intrinsic == nir_intrinsic_load_interpolated_input) {
 
-            nir_io_semantics sem =
-               nir_intrinsic_io_semantics(intr);
-
-            int row =
-               fp_lookup_varying_row(&ctx->fp->info,
-                                     sem.location);
+            int row = nir_intrinsic_base(intr) ;
 
             fprintf(stderr,
-                    "FP FIND location=%d row=%d\n",
-                    sem.location,
+                    "FP FIND base=%u row=%d\n",
+                    nir_intrinsic_base(intr),
                     row);
 
-
-            return row ;
+            return row;
          }
       }
 
       if (instr->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
 
-         nir_alu_instr *alu =
-            nir_instr_as_alu(instr);
-
-         if (alu->op == nir_op_vec2 ||
+         if (alu->op == nir_op_mov ||
+             alu->op == nir_op_vec4 ||
              alu->op == nir_op_vec3 ||
-             alu->op == nir_op_vec4) {
+             alu->op == nir_op_vec2) {
 
-            instr =
-               nir_def_instr(alu->src[0].src.ssa);
-
+            instr = nir_def_instr(alu->src[0].src.ssa);
             continue;
          }
       }
@@ -962,13 +915,6 @@ fp_find_varying_row(struct fp_nir_ctx *ctx, nir_instr *instr)
 static void
 fp_emit_tex(struct fp_nir_ctx *ctx, nir_tex_instr *tex)
 {
-   struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
-
-   inst->tex.enable = true;
-   inst->tex.sampler = tex->sampler_index;
-   inst->tex.dst_r2_r3 = true;
-   inst->tex.src_r2_r3 = false;
-
    unsigned coord_src_idx =
       nir_tex_instr_src_index(tex, nir_tex_src_coord);
 
@@ -989,45 +935,64 @@ fp_emit_tex(struct fp_nir_ctx *ctx, nir_tex_instr *tex)
            ">>> GRATE-FP: TEX coordinate row=%d\n",
            row);
 
+   /* 1. Build MFU instruction for UV coordinate interpolation */
    struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
    list_inithead(&mfu->link);
 
-   mfu->var[0].op = FP_VAR_OP_FP20;
-   mfu->var[0].tram_row = row;
-
-   mfu->var[1].op = FP_VAR_OP_FP20;
-   mfu->var[1].tram_row = row;
-
-   mfu->var[2].op = FP_VAR_OP_FP20;
-   mfu->var[2].tram_row = row;
+   /* Interpolate all 4 components (S, T, R, Q/W) */
+   for (int i = 0; i < 4; i++) {
+      mfu->var[i].op = FP_VAR_OP_FP20;
+      mfu->var[i].tram_row = row;
+   }
 
    ctx->fp->info.max_tram_row =
       MAX2(ctx->fp->info.max_tram_row, row);
 
-   inst->mfu_sched.address =
-      list_length(&ctx->fp->mfu_instructions);
+   list_addtail(&mfu->link, &ctx->fp->mfu_instructions);
 
-   inst->mfu_sched.num_instructions = 1;
+   /* 2. Emit FP instruction slot 1: MFU fetch ONLY */
+   struct fp_instr *mfu_inst = CALLOC_STRUCT(fp_instr);
+   mfu_inst->mfu_sched.address = list_length(&ctx->fp->mfu_instructions) - 1;
+   mfu_inst->mfu_sched.num_instructions = 1;
+   list_addtail(&mfu_inst->link, &ctx->fp->fp_instructions);
 
-   list_addtail(&mfu->link,
-                &ctx->fp->mfu_instructions);
+   /* 3. Emit FP instruction slot 2: TEX sampler ONLY */
+   struct fp_instr *tex_inst = CALLOC_STRUCT(fp_instr);
+   tex_inst->tex.enable = true;
+   tex_inst->tex.sampler = tex->sampler_index;
+   tex_inst->tex.dst_r2_r3 = true;
+   tex_inst->tex.src_r2_r3 = false;
+   tex_inst->mfu_sched.num_instructions = 0;
 
-   list_addtail(&inst->link,
-                &ctx->fp->fp_instructions);
+   list_addtail(&tex_inst->link, &ctx->fp->fp_instructions);
 
    ctx->tex_def = &tex->def;
 }
-
 
 static void
 fp_emit_intrinsic(struct fp_nir_ctx *ctx, nir_intrinsic_instr *intr)
 {
    switch (intr->intrinsic) {
-   case nir_intrinsic_load_input:
-   case nir_intrinsic_load_interpolated_input:
+case nir_intrinsic_load_input:
+case nir_intrinsic_load_interpolated_input: {
+   int row = nir_intrinsic_base(intr); //resolved_varying_row(&ctx->fp->info, intr);
+
+   if (!ctx->mfu) {
+      ctx->mfu = CALLOC_STRUCT(fp_mfu_instr);
+      list_inithead(&ctx->mfu->link);
+   }
+
+   unsigned num_components = intr->def.num_components;
+   for (unsigned comp = 0; comp < num_components; comp++) {
+      ctx->mfu->var[comp].op = FP_VAR_OP_FP20;
+      ctx->mfu->var[comp].tram_row = row;
+   }
+
+   ctx->fp->info.max_tram_row = MAX2(ctx->fp->info.max_tram_row, row);
+   return;
+}
    case nir_intrinsic_load_uniform:
    case nir_intrinsic_load_barycentric_pixel:
-      /* resolved where they are used */
       return;
 
    case nir_intrinsic_store_output:
@@ -1191,6 +1156,29 @@ fp_release_use(nir_src *src, void *data)
    return true;
 }
 
+static bool
+fp_init_last_use(nir_def *def, void *data)
+{
+   struct fp_use_ctx *u = data;
+   u->ctx->last_use[def->index] = u->idx;
+   return true;
+}
+
+static bool
+fp_release_def_slot(nir_def *def, void *data)
+{
+   struct fp_use_ctx *u = data;
+   struct fp_nir_ctx *ctx = u->ctx;
+   unsigned i = def->index;
+
+   if (ctx->last_use[i] == u->idx && ctx->ssa_slot[i] >= 0) {
+      if (ctx->num_dying < ARRAY_SIZE(ctx->dying))
+         ctx->dying[ctx->num_dying++] = ctx->ssa_slot[i];
+      ctx->ssa_slot[i] = -1;
+   }
+   return true;
+}
+
 void
 grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
 {
@@ -1206,55 +1194,36 @@ grate_nir_to_fp(struct grate_fp_shader *fp, nir_shader *s)
    fp->info.num_inputs = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+   fp->info.num_varyings = 0;
 
-fp->info.num_varyings = 0;
+   nir_foreach_shader_in_variable(var, s) {
+      unsigned row = var->data.driver_location + 1;
+      fprintf(stderr,
+              "FP INPUT location=%d driver_location=%d name=%s\n",
+              var->data.location,
+              var->data.driver_location,
+              var->name ? var->name : "(null)");
 
-nir_foreach_shader_in_variable(var, s) {
-/*
-   On Tegra's 3D hardware pipeline (GR3D), fragment inputs (varyings) are passed through an on-chip interpolation buffer 
-      known as the TRAM.Row 0 of this buffer is hard-allocated and reserved by the hardware engine itself for built-in 
-      attributes—specifically fragment position, window coordinates (WPOS / gl_FragCoord), or homogeneous $W$.Because the 
-   hardware unconditionally hijacks row 0 for position data, user-defined varyings and texture coordinates cannot start at 
-   index 0. They must be shifted down by one slot, starting at row 1 (driver_location + 1). Gallium state tracker has no 
-   concept of NVIDIA Tegra's GR3D hardware architecture, nor does it know that TRAM Row 0 is permanently hijacked by the 
-   silicon and the frontend knows nothing about Tegra's physical constraints, it assigns driver_location sequentially starting from 0.
-  */
-   
-   unsigned row = var->data.driver_location + 1 ; //plus one
+      if (var->data.location == VARYING_SLOT_COL0)
+         fp->info.color_input = row;
 
-fprintf(stderr,
-        "FP INPUT location=%d driver_location=%d name=%s\n",
-        var->data.location,
-        var->data.driver_location,
-        var->name ? var->name : "(null)");
+      if (fp->info.num_varyings < ARRAY_SIZE(fp->info.varying_map)) {
+         fp->info.varying_map[fp->info.num_varyings].location = var->data.location;
+         fp->info.varying_map[fp->info.num_varyings].row = row;
 
-if (var->data.location == VARYING_SLOT_COL0)
-   fp->info.color_input = row;
+         fprintf(stderr,
+                 "FP MAP ADD location=%d row=%u\n",
+                 var->data.location,
+                 row);
 
+         fp->info.num_varyings++;
+      }
 
-if (fp->info.num_varyings <
-    ARRAY_SIZE(fp->info.varying_map)) {
-
-   fp->info.varying_map[fp->info.num_varyings].location =
-      var->data.location + 1;
-
-   fp->info.varying_map[fp->info.num_varyings].row =
-      row;
-
-fprintf(stderr,
-"FP MAP ADD location=%d row=%u\n",
-var->data.location,
-row);
-
-   fp->info.num_varyings++;
-}
-
-fprintf(stderr,
-        ">>> GRATE-FP: input loc=%d row=%u name=%s\n",
-        var->data.location,
-        row,
-        var->name ? var->name : "(null)");
-
+      fprintf(stderr,
+              ">>> GRATE-FP: input loc=%d row=%u name=%s\n",
+              var->data.location,
+              row,
+              var->name ? var->name : "(null)");
 
       unsigned n = glsl_get_vector_elements(glsl_without_array(var->type));
       uint32_t dst = 0;
@@ -1266,7 +1235,6 @@ fprintf(stderr,
          fp->info.inputs[fp->info.num_inputs].dst = dst;
          fp->info.num_inputs++;
       }
-
       if (row > fp->info.max_tram_row)
          fp->info.max_tram_row = row;
    }
@@ -1293,11 +1261,14 @@ fprintf(stderr,
       unsigned idx = 0;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
+            nir_foreach_def(instr, fp_init_last_use, &(struct fp_use_ctx){
+               .ctx = &ctx, .idx = idx });
             nir_foreach_src(instr, fp_note_use, &(struct fp_use_ctx){
                .ctx = &ctx, .idx = idx });
-           idx++;
+            idx++;
          }
       }
+
       nir_foreach_block_reverse(block, impl) {
          nir_foreach_instr_reverse(instr, block) {
             if (instr->type != nir_instr_type_alu)
@@ -1313,6 +1284,36 @@ fprintf(stderr,
       }
    }
 
+/* Pass 1: Emit input loads first so MFU stages non-texture varyings early */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_input ||
+                intr->intrinsic == nir_intrinsic_load_interpolated_input)
+               fp_emit_intrinsic(&ctx, intr);
+         }
+      }
+   }
+
+   /*
+    * Explicitly emit fp[0] containing ONLY the MFU load.
+    * This creates the 1-cycle pipeline gap required for MFU varyings to land in s0..s3.
+    */
+   if (ctx.mfu) {
+      struct fp_instr *inst = fp_new_instr();
+      inst->mfu_sched.address = list_length(&fp->mfu_instructions);
+      inst->mfu_sched.num_instructions = 1;
+      inst->alu_sched.address = 0;
+      inst->alu_sched.num_instructions = 0; /* NO ALU INSTRUCTION IN FP[0] */
+
+      list_addtail(&ctx.mfu->link, &fp->mfu_instructions);
+      list_addtail(&inst->link, &fp->fp_instructions);
+
+      ctx.mfu = NULL;
+   }
+
+   /* Pass 2: Emit remaining instructions (ALU, TEX, non-input intrinsics) */
    unsigned idx = 0;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
@@ -1320,9 +1321,12 @@ fprintf(stderr,
          case nir_instr_type_alu:
             fp_emit_alu(&ctx, nir_instr_as_alu(instr));
             break;
-         case nir_instr_type_intrinsic:
-            fp_emit_intrinsic(&ctx, nir_instr_as_intrinsic(instr));
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_input)
+               fp_emit_intrinsic(&ctx, intr);
             break;
+         }
          case nir_instr_type_tex:
             fp_emit_tex(&ctx, nir_instr_as_tex(instr));
             break;
@@ -1338,6 +1342,16 @@ fprintf(stderr,
          }
          nir_foreach_src(instr, fp_release_use, &(struct fp_use_ctx){
             .ctx = &ctx, .idx = idx });
+         nir_foreach_def(instr, fp_release_def_slot, &(struct fp_use_ctx){
+            .ctx = &ctx, .idx = idx });
+
+         /* Transfer dying slots into the free pool */
+         for (unsigned i = 0; i < ctx.num_dying; ++i) {
+            if (ctx.num_free < ARRAY_SIZE(ctx.free_slot)) {
+               ctx.free_slot[ctx.num_free++] = ctx.dying[i];
+            }
+         }
+         ctx.num_dying = 0;
          idx++;
       }
    }
@@ -1350,14 +1364,24 @@ fprintf(stderr,
    if (!list_is_empty(&fp->fp_instructions)) {
       struct fp_instr *last =
          list_last_entry(&fp->fp_instructions, struct fp_instr, link);
+
+      /*
+       * If the last instruction slot has active MFU work, append a clean
+       * instruction slot for dw=1 so MFU loads do not collide with texture return.
+       */
+      if (last->mfu_sched.num_instructions > 0) {
+         struct fp_instr *dw_inst = CALLOC_STRUCT(fp_instr);
+         list_addtail(&dw_inst->link, &fp->fp_instructions);
+         last = dw_inst;
+      }
+
       last->dw.enable = 1;
       last->dw.index = 0;
       last->dw.stencil_write = 0;
       last->dw.src_regs = FP_DW_REGS_R2_R3;
    }
+
    if (ctx.overflow)
       fp->unsupported = true;
    grate_fp_finish(fp);
 }
-
-

@@ -333,41 +333,32 @@ vp_emit_vec(struct vp_nir_ctx *ctx, nir_alu_instr *alu, unsigned n)
 {
    int dst = vp_temp_for_def(ctx, &alu->def);
 
-   for (unsigned i = 0; i < n; ++i) {
-      unsigned src_idx = i;
-      if (n == 3) {
-         /*
-          * Correct Map:
-          * index 0 (.x) <- texcoord.x (source 1) -> S
-          * index 1 (.y) <- texcoord.y (source 2) -> T
-          * index 2 (.z) <- lighting   (source 0) -> Lighting
-          */
-         static const uint8_t map[3] = { 1, 2, 0 };
-         src_idx = map[i];
-      }
+for (unsigned i = 0; i < n; ++i) {
+   unsigned src_idx = i;
 
-      struct vp_src_operand src = vp_src(ctx, alu->src[src_idx].src, alu->src[src_idx].swizzle);
+   struct vp_src_operand src =
+      vp_src(ctx,
+             alu->src[src_idx].src,
+             alu->src[src_idx].swizzle);
 
-      unsigned swz_elem = alu->src[src_idx].swizzle[0];
-      for (int c = 0; c < 4; ++c)
-         src.swizzle[c] = (enum vp_swz)swz_elem;
+   unsigned swz_elem =
+      alu->src[src_idx].swizzle[0];
 
-      vp_stage_fetches(ctx, &src, 1);
+   for (int c = 0; c < 4; ++c)
+      src.swizzle[c] = (enum vp_swz)swz_elem;
 
-      struct vp_vec_instr v = vp_vnop();
-      v.op = VP_VEC_OP_MOV;
-      v.dst.file = VP_DST_FILE_TEMP;
-      v.dst.index = dst;
-      v.dst.write_mask = 1u << i;
-      v.src[0] = src;
-      
-      // If you want to handle 1.0 - T inversion right here for component .y:
-      // (Assuming grate's vector instruction format supports constant/negation modifiers, 
-      // or you can leave V-inversion to the NIR pass we built earlier and just fix the map here)
+   vp_stage_fetches(ctx, &src, 1);
 
-//      vp_push(ctx->vp, v, vp_snop());
-      vp_nir_push(ctx, v, vp_snop()); 
-  }
+   struct vp_vec_instr v = vp_vnop();
+   v.op = VP_VEC_OP_MOV;
+   v.dst.file = VP_DST_FILE_TEMP;
+   v.dst.index = dst;
+   v.dst.write_mask = 1u << i;
+   v.src[0] = src;
+
+   vp_nir_push(ctx, v, vp_snop());
+}
+
 }
 
 

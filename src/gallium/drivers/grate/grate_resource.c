@@ -645,6 +645,26 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    *ptrp = ptr;
 }
 
+static uint32_t
+pack_clear_value(enum pipe_format format, uint32_t raw_val, unsigned int blocksize)
+{
+   switch (blocksize) {
+   case 1:
+      /* Replicate 8-bit value across all 4 bytes */
+      raw_val &= 0xff;
+      return raw_val | (raw_val << 8) | (raw_val << 16) | (raw_val << 24);
+
+   case 2:
+      /* Replicate 16-bit value across high and low half-words */
+      raw_val &= 0xffff;
+      return raw_val | (raw_val << 16);
+
+   case 4:
+   default:
+      return raw_val;
+   }
+}
+
 static void
 grate_clear(struct pipe_context *pcontext, unsigned int buffers,
             uint32_t color_clear_mask, uint8_t stencil_clear_mask,
@@ -652,7 +672,6 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
             const union pipe_color_union *color, double depth,
             unsigned int stencil)
 {
-   /* one render target only: the per-buffer clear masks add nothing */
    (void)color_clear_mask;
    (void)stencil_clear_mask;
    struct grate_context *context = grate_context(pcontext);
@@ -663,6 +682,9 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
 
    fb = &context->framebuffer.base;
 
+   /* 1. Flush GR3D first so pending draws complete before GR2D clears buffers */
+   if (context->gr3d)
+      grate_stream_wait(&context->gr3d->stream);
 
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
@@ -671,32 +693,34 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
    }
 
    if (buffers & PIPE_CLEAR_COLOR) {
-      int i;
-      for (i = 0; i < fb->nr_cbufs; ++i) {
+      for (int i = 0; i < fb->nr_cbufs; ++i) {
          struct pipe_surface *dst = &fb->cbufs[i];
-         fill(stream, &ptr, 
-                  grate_resource(dst->texture),
-                  pack_color(dst->format, color->f),
-                  util_format_get_blocksize(dst->format),
-                  0, 0, fb->width, fb->height);
+         unsigned blocksize = util_format_get_blocksize(dst->format);
+         uint32_t packed_color = pack_color(dst->format, color->f);
+
+         fill(stream, &ptr,
+              grate_resource(dst->texture),
+              pack_clear_value(dst->format, packed_color, blocksize),
+              blocksize, 0, 0, fb->width, fb->height);
       }
    }
 
    if (buffers & PIPE_CLEAR_DEPTH || buffers & PIPE_CLEAR_STENCIL) {
       if (fb->zsbuf.texture) {
-         /* TODO: handle the case where both are not set! */
-         fill(stream, &ptr, 
-                  grate_resource(fb->zsbuf.texture),
-                  util_pack_z_stencil(fb->zsbuf.format, depth, stencil),
-                  util_format_get_blocksize(fb->zsbuf.format),
-                  0, 0, fb->width, fb->height);
+         unsigned blocksize = util_format_get_blocksize(fb->zsbuf.format);
+         uint32_t raw_z_stencil = util_pack_z_stencil(fb->zsbuf.format, depth, stencil);
+
+         fill(stream, &ptr,
+              grate_resource(fb->zsbuf.texture),
+              pack_clear_value(fb->zsbuf.format, raw_z_stencil, blocksize),
+              blocksize, 0, 0, fb->width, fb->height);
       }
    }
-   
+
    grate_stream_end(stream, &ptr);
    grate_stream_flush(stream, true);
-
 }
+
 
 static void
 grate_clear_render_target(struct pipe_context *pipe,

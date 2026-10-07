@@ -162,5 +162,8 @@ grate_screen_context_create(struct pipe_screen *pscreen,
    grate_context_vbo_init(&context->base);
    grate_context_draw_init(&context->base);
 
+/* Force initial VPM crossbar emission on the first draw call */
+   context->dirty |= GRATE_DIRTY_VPM;
+
    return &context->base;
 }
